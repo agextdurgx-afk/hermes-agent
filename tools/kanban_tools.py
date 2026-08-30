@@ -62,6 +62,40 @@ def _profile_has_kanban_toolset() -> bool:
         return False
 
 
+def _current_profile_name() -> str:
+    """Resolve the profile that owns the current tool call."""
+    for key in ("HERMES_PROFILE_NAME", "HERMES_PROFILE"):
+        value = (os.environ.get(key) or "").strip()
+        if value:
+            return value
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+
+        return (get_active_profile_name() or "").strip()
+    except Exception:
+        return ""
+
+
+def _configured_orchestrator_profile() -> str:
+    """Return the optional profile allowed to route Kanban work."""
+    try:
+        cfg = load_config()
+        return str(cfg_get(cfg, "kanban", "orchestrator_profile", default="") or "").strip()
+    except Exception:
+        return ""
+
+
+def _has_task_routing_authority() -> bool:
+    """Preserve legacy fan-out unless a profile explicitly owns routing."""
+    configured = _configured_orchestrator_profile()
+    return not configured or _current_profile_name() == configured
+
+
+def _check_kanban_routing_mode() -> bool:
+    """Expose create/link only to the configured routing profile."""
+    return _has_task_routing_authority() and _check_kanban_mode()
+
+
 def _is_delegated_child_context() -> bool:
     try:
         from agent.delegation_context import is_delegated_child_context
@@ -478,6 +512,18 @@ def _require_orchestrator_tool(tool_name: str) -> Optional[str]:
             f"{tool_name} is orchestrator-only; dispatcher-spawned workers "
             "must use kanban_complete, kanban_block, kanban_heartbeat, or "
             "kanban_comment for their assigned task."
+        )
+    return None
+
+
+def _require_task_routing_authority(tool_name: str) -> Optional[str]:
+    """Runtime backstop for profile-scoped create/link/unblock authority."""
+    configured = _configured_orchestrator_profile()
+    if configured and _current_profile_name() != configured:
+        return tool_error(
+            f"{tool_name} refused: only configured Kanban orchestrator profile "
+            f"{configured!r} may create, link, unblock, schedule, or retry work. "
+            "Report the follow-up or blocker in the current task handoff."
         )
     return None
 
@@ -1349,6 +1395,9 @@ def _handle_create(args: dict, **kw) -> str:
     delegated_err = _reject_delegated_child_mutation("kanban_create")
     if delegated_err:
         return delegated_err
+    authority_err = _require_task_routing_authority("kanban_create")
+    if authority_err:
+        return authority_err
     title = args.get("title")
     if not title or not str(title).strip():
         return tool_error("title is required")
@@ -1617,6 +1666,9 @@ def _handle_unblock(args: dict, **kw) -> str:
     guard = _require_orchestrator_tool("kanban_unblock")
     if guard:
         return guard
+    authority_err = _require_task_routing_authority("kanban_unblock")
+    if authority_err:
+        return authority_err
     tid = args.get("task_id")
     if not tid:
         return tool_error("task_id is required")
@@ -1646,6 +1698,9 @@ def _handle_link(args: dict, **kw) -> str:
     delegated_err = _reject_delegated_child_mutation("kanban_link")
     if delegated_err:
         return delegated_err
+    authority_err = _require_task_routing_authority("kanban_link")
+    if authority_err:
+        return authority_err
     parent_id = args.get("parent_id")
     child_id = args.get("child_id")
     if not parent_id or not child_id:
@@ -2457,7 +2512,7 @@ registry.register(
     toolset="kanban",
     schema=KANBAN_CREATE_SCHEMA,
     handler=_handle_create,
-    check_fn=_check_kanban_mode,
+    check_fn=_check_kanban_routing_mode,
     emoji="➕",
 )
 
@@ -2466,7 +2521,7 @@ registry.register(
     toolset="kanban",
     schema=KANBAN_UNBLOCK_SCHEMA,
     handler=_handle_unblock,
-    check_fn=_check_kanban_orchestrator_mode,
+    check_fn=lambda: _check_kanban_orchestrator_mode() and _has_task_routing_authority(),
     emoji="▶",
 )
 
@@ -2475,6 +2530,6 @@ registry.register(
     toolset="kanban",
     schema=KANBAN_LINK_SCHEMA,
     handler=_handle_link,
-    check_fn=_check_kanban_mode,
+    check_fn=_check_kanban_routing_mode,
     emoji="🔗",
 )

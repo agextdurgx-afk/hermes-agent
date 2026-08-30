@@ -981,6 +981,29 @@ def _make_create_ns(**overrides):
     return ns
 
 
+def test_worker_cli_cannot_bypass_configured_task_routing_authority(monkeypatch, capsys):
+    from hermes_cli import kanban as kb_cli
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_worker")
+    monkeypatch.setenv("HERMES_PROFILE", "tezoffmerchantoffers")
+    monkeypatch.setattr(kb_cli, "_configured_kanban_orchestrator_profile", lambda: "tezoffcoordinator")
+    args = _make_create_ns(kanban_action="create")
+
+    assert kb_cli.kanban_command(args) == 1
+    assert "only configured orchestrator profile 'tezoffcoordinator'" in capsys.readouterr().err
+
+
+def test_coordinator_worker_retains_cli_task_routing_authority(monkeypatch):
+    from hermes_cli import kanban as kb_cli
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_coordinator")
+    monkeypatch.setenv("HERMES_PROFILE", "tezoffcoordinator")
+    monkeypatch.setattr(kb_cli, "_configured_kanban_orchestrator_profile", lambda: "tezoffcoordinator")
+
+    assert kb_cli._worker_lacks_task_routing_authority("create") is False
+    assert kb_cli._worker_lacks_task_routing_authority("schedule") is False
+
+
 def test_cli_daemon_help_marks_deprecated():
     """The argparse help string on `daemon` mentions deprecation so users
     scanning `--help` see the migration before running the stub."""
@@ -1406,5 +1429,4 @@ def test_notify_sub_starts_caught_up_on_active_task(kanban_home):
         assert events == [], "historical events must not replay to a new sub"
     finally:
         conn.close()
-
 

@@ -657,6 +657,37 @@ def test_worker_can_comment_on_foreign_task(worker_env):
         conn.close()
 
 
+def test_configured_orchestrator_blocks_worker_task_creation(monkeypatch, worker_env, tmp_path):
+    """A project can reserve task routing for one named coordinator profile."""
+    config = tmp_path / ".hermes" / "config.yaml"
+    config.write_text(
+        "kanban:\n  orchestrator_profile: tezoffcoordinator\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_PROFILE", "tezoffmerchantoffers")
+
+    from tools import kanban_tools as kt
+    out = kt._handle_create({"title": "bad retry", "assignee": "tezoffmerchantoffers"})
+    error = json.loads(out).get("error", "")
+    assert "only configured Kanban orchestrator profile" in error
+    assert "tezoffcoordinator" in error
+
+
+def test_configured_orchestrator_can_create_from_worker_task(monkeypatch, worker_env, tmp_path):
+    """The named coordinator retains explicit decomposition authority."""
+    config = tmp_path / ".hermes" / "config.yaml"
+    config.write_text(
+        "kanban:\n  orchestrator_profile: tezoffcoordinator\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_PROFILE", "tezoffcoordinator")
+
+    from tools import kanban_tools as kt
+    out = kt._handle_create({"title": "bounded follow-up", "assignee": "tezoffcatalog"})
+    result = json.loads(out)
+    assert result.get("ok") is True, result
+
+
 def test_worker_unblock_rejects_foreign_task_id(worker_env):
     """A worker cannot unblock any task — kanban_unblock is orchestrator-only.
 

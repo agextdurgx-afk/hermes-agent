@@ -1088,6 +1088,16 @@ def kanban_command(args: argparse.Namespace) -> int:
         )
         return 1
 
+    if _worker_lacks_task_routing_authority(action):
+        configured = _configured_kanban_orchestrator_profile()
+        print(
+            "kanban: task routing refused; only configured orchestrator "
+            f"profile {configured!r} may run {action!r}. Report the follow-up "
+            "or blocker in the current task handoff.",
+            file=sys.stderr,
+        )
+        return 1
+
     # Board-management commands operate on board metadata and the persisted
     # current-board pointer itself. They must ignore the shared `--board`
     # task-routing override; otherwise `/kanban --board beta boards show`
@@ -1216,6 +1226,45 @@ def _profile_author() -> str:
         return get_active_profile_name() or "user"
     except Exception:
         return "user"
+
+
+_TASK_ROUTING_ACTIONS: frozenset[str] = frozenset({
+    "create",
+    "swarm",
+    "assign",
+    "set-model",
+    "reclaim",
+    "reassign",
+    "link",
+    "unlink",
+    "claim",
+    "edit",
+    "schedule",
+    "unblock",
+    "promote",
+    "archive",
+    "dispatch",
+    "specify",
+    "decompose",
+})
+
+
+def _configured_kanban_orchestrator_profile() -> str:
+    try:
+        from hermes_cli.config import cfg_get, load_config
+
+        cfg = load_config()
+        return str(cfg_get(cfg, "kanban", "orchestrator_profile", default="") or "").strip()
+    except Exception:
+        return ""
+
+
+def _worker_lacks_task_routing_authority(action: str) -> bool:
+    """Prevent a task-scoped specialist from bypassing tool gates via CLI."""
+    if action not in _TASK_ROUTING_ACTIONS or not os.environ.get("HERMES_KANBAN_TASK"):
+        return False
+    configured = _configured_kanban_orchestrator_profile()
+    return bool(configured and _profile_author() != configured)
 
 
 _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
