@@ -89,6 +89,45 @@ agent:
         assert required in pinned
 
 
+def test_default_spawn_honours_narrow_worker_toolset_override(monkeypatch, tmp_path):
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / "bounded"
+    profile.mkdir(parents=True)
+    profile.joinpath("config.yaml").write_text(
+        """
+platform_toolsets:
+  cli: [browser, file, kanban, web]
+kanban:
+  worker_toolsets: [file, kanban, web_extract_only, browser_navigate_only]
+""".lstrip(),
+        encoding="utf-8",
+    )
+    root.joinpath("config.yaml").write_text("{}\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(root))
+
+    from hermes_cli import kanban_db as kb
+
+    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+    captured = {}
+
+    class FakeProc:
+        pid = 4242
+
+    def fake_popen(cmd, *args, **kwargs):
+        captured["cmd"] = list(cmd)
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    kb._default_spawn(_make_task(kb, assignee="bounded"), str(workspace))
+
+    pinned = captured["cmd"][captured["cmd"].index("--toolsets") + 1].split(",")
+    assert pinned == ["browser_navigate_only", "file", "kanban", "web_extract_only"]
+    assert "browser" not in pinned
+    assert "web" not in pinned
+
+
 def test_default_spawn_model_override_survives_real_cli_parse(monkeypatch, tmp_path):
     """The dispatcher's pre-``chat`` model flag must reach ``args.model``.
 

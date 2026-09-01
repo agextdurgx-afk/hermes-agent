@@ -10678,10 +10678,8 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
         token = set_hermes_home_override(hermes_home)
         try:
             cfg = load_config()
-            toolsets = sorted(_get_platform_tools(cfg, "cli"))
         finally:
             reset_hermes_home_override(token)
-        return toolsets or None
     except Exception as exc:
         _log.debug(
             "kanban worker: could not resolve CLI toolsets for HERMES_HOME=%r (%s)",
@@ -10689,6 +10687,30 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
             exc,
         )
         return None
+
+    # A reviewed profile may narrow detached Kanban workers below its generic
+    # interactive CLI surface. This list is passed through as toolset names,
+    # not reverse-mapped through platform defaults, because a narrow custom
+    # toolset (for example URL extraction without search) must not expand back
+    # into its broader configurable parent. Invalid explicit policy is a hard
+    # spawn failure: silently falling back would re-grant the generic surface.
+    worker_override = (cfg.get("kanban") or {}).get("worker_toolsets")
+    if worker_override is not None:
+        if not isinstance(worker_override, list) or not worker_override:
+            raise ValueError("kanban.worker_toolsets must be a non-empty list")
+        from toolsets import resolve_toolset
+
+        normalized = []
+        for raw_name in worker_override:
+            name = str(raw_name).strip()
+            if not name or not resolve_toolset(name):
+                raise ValueError(f"kanban.worker_toolsets contains unknown or empty toolset {raw_name!r}")
+            if name not in normalized:
+                normalized.append(name)
+        return sorted(normalized)
+
+    toolsets = sorted(_get_platform_tools(cfg, "cli"))
+    return toolsets or None
 
 
 _retagged_workspace_roots: set[str] = set()

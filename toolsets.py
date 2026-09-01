@@ -113,6 +113,12 @@ TOOLSETS = {
         "tools": ["web_extract"],
         "includes": []
     },
+
+    "browser_navigate_only": {
+        "description": "URL-bounded browser navigation without search or interaction tools",
+        "tools": ["browser_navigate"],
+        "includes": []
+    },
     
     "search": {
         "description": "Web search only (no content extraction/scraping)",

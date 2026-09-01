@@ -37,6 +37,12 @@ class TestGetToolset:
         assert tools == ["web_extract"]
         assert "web_search" not in tools
 
+    def test_browser_navigate_only_toolset_excludes_search_and_interaction(self):
+        tools = resolve_toolset("browser_navigate_only")
+        assert tools == ["browser_navigate"]
+        assert "web_search" not in tools
+        assert "browser_click" not in tools
+
     def test_x_search_toolset_marks_read_only_and_points_to_xurl(self):
         ts = get_toolset("x_search")
         assert ts is not None
