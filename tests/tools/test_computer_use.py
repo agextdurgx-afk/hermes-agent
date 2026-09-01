@@ -2334,7 +2334,104 @@ class TestElementTokenAttachment:
 
         # Stale 99 token is gone; only the two new tokens remain.
         assert backend._snapshot_tokens == {1: "snap2:1", 2: "snap2:2"}
+        assert sorted(backend._snapshot_elements) == [1, 2]
+        assert backend._snapshot_elements[1].role == "AXButton"
         assert backend._snapshot_id == "s1234abcd"
+
+
+class TestBoundedClickTargetGuard:
+    """A bounded profile may restrict clicks to AX targets from the latest capture."""
+
+    @staticmethod
+    def _backend():
+        from unittest.mock import MagicMock
+        from tools.computer_use.backend import UIElement
+        from tools.computer_use.cua_backend import CuaDriverBackend
+
+        backend = CuaDriverBackend()
+        backend.permission_mode = "bounded"
+        backend._bounded_click_targets = {
+            "allowed_roles": frozenset({"AXLink", "AXButton"}),
+            "allowed_labels_by_role": {"AXButton": ("Back",)},
+            "require_nonempty_label": True,
+            "deny_coordinate_clicks": True,
+        }
+        backend._active_pid = 111
+        backend._active_window_id = 222
+        backend._snapshot_elements = {
+            5: UIElement(index=5, role="AXLink", label="Card discussion"),
+            6: UIElement(index=6, role="AXButton", label="Back"),
+            7: UIElement(index=7, role="AXButton", label="Reload"),
+            188: UIElement(index=188, role="AXList", label=""),
+        }
+        backend._session = MagicMock()
+        backend._session.call_tool.return_value = {
+            "data": "ok", "images": [], "image_mime_types": [],
+            "structuredContent": {"ok": True}, "isError": False,
+        }
+        backend._session.supports_capability = lambda cap, tool=None: False
+        backend._session.supports_input_property = lambda tool, prop: False
+        return backend
+
+    def test_refuses_non_actionable_role_before_driver_input(self):
+        backend = self._backend()
+
+        result = backend.click(element=188)
+
+        assert result.ok is False
+        assert result.code == "bounded_click_target_denied"
+        assert result.meta["target_element"]["role"] == "AXList"
+        backend._session.call_tool.assert_not_called()
+
+    def test_refuses_unknown_or_stale_element_before_driver_input(self):
+        backend = self._backend()
+
+        result = backend.click(element=999)
+
+        assert result.ok is False
+        assert "latest capture" in result.message
+        backend._session.call_tool.assert_not_called()
+
+    def test_allows_labelled_link_and_records_exact_target(self):
+        backend = self._backend()
+
+        result = backend.click(element=5)
+
+        assert result.ok is True
+        assert result.meta["target_element"] == {
+            "index": 5,
+            "role": "AXLink",
+            "label": "Card discussion",
+        }
+        backend._session.call_tool.assert_called_once()
+        assert backend._snapshot_elements == {}
+
+        stale = backend.click(element=5)
+        assert stale.ok is False
+        assert "latest capture" in stale.message
+        backend._session.call_tool.assert_called_once()
+
+    def test_allows_only_the_named_button(self):
+        allowed_backend = self._backend()
+        denied_backend = self._backend()
+
+        allowed = allowed_backend.click(element=6)
+        denied = denied_backend.click(element=7)
+
+        assert allowed.ok is True
+        assert denied.ok is False
+        assert "not permitted" in denied.message
+        allowed_backend._session.call_tool.assert_called_once()
+        denied_backend._session.call_tool.assert_not_called()
+
+    def test_refuses_coordinate_click_before_driver_input(self):
+        backend = self._backend()
+
+        result = backend.click(x=20, y=30)
+
+        assert result.ok is False
+        assert "coordinate clicks are denied" in result.message
+        backend._session.call_tool.assert_not_called()
 
 
 class TestSessionLifecycle:

@@ -309,6 +309,62 @@ def _cua_capability_manifest() -> Optional[str]:
     return raw.strip()
 
 
+def _bounded_click_target_policy() -> Optional[Dict[str, Any]]:
+    """Return the optional profile-owned guard for bounded element clicks.
+
+    A capability manifest authorizes *which tool* may run.  Some workflows
+    need a narrower semantic ceiling as well (for example, links plus one
+    named Back button).  This reviewed profile setting makes the wrapper
+    validate the requested element against the latest capture before any
+    input reaches cua-driver.
+
+    The policy is deliberately inert outside bounded mode and when omitted.
+    A present but malformed policy raises at backend construction so a typo
+    cannot silently widen the allowed click surface.
+    """
+    raw = _computer_use_cfg().get("bounded_click_targets")
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError("computer_use.bounded_click_targets must be a mapping")
+
+    roles = raw.get("allowed_roles")
+    if not isinstance(roles, list) or not roles or any(
+        not isinstance(role, str) or not role.strip() for role in roles
+    ):
+        raise ValueError(
+            "computer_use.bounded_click_targets.allowed_roles must be a non-empty string list"
+        )
+
+    labels_raw = raw.get("allowed_labels_by_role", {})
+    if not isinstance(labels_raw, dict):
+        raise ValueError(
+            "computer_use.bounded_click_targets.allowed_labels_by_role must be a mapping"
+        )
+    labels: Dict[str, Tuple[str, ...]] = {}
+    for role, values in labels_raw.items():
+        if role not in roles or not isinstance(values, list) or any(
+            not isinstance(value, str) or not value.strip() for value in values
+        ):
+            raise ValueError(
+                "computer_use.bounded_click_targets label rules must use an allowed role and string list"
+            )
+        labels[role] = tuple(value.strip() for value in values)
+
+    for field in ("require_nonempty_label", "deny_coordinate_clicks"):
+        if field in raw and not isinstance(raw[field], bool):
+            raise ValueError(
+                f"computer_use.bounded_click_targets.{field} must be a boolean"
+            )
+
+    return {
+        "allowed_roles": frozenset(role.strip() for role in roles),
+        "allowed_labels_by_role": labels,
+        "require_nonempty_label": raw.get("require_nonempty_label", True) is True,
+        "deny_coordinate_clicks": raw.get("deny_coordinate_clicks", True) is True,
+    }
+
+
 def _cua_grant_existing_profile() -> bool:
     """True when the user pre-authorized existing-profile browser attachment.
 
@@ -2779,6 +2835,9 @@ class CuaDriverBackend(ComputerUseBackend):
         if permission_mode not in {"standard", "bounded", "unrestricted"}:
             raise ValueError(f"unsupported cua-driver permission mode: {permission_mode}")
         self.permission_mode = permission_mode
+        self._bounded_click_targets = (
+            _bounded_click_target_policy() if permission_mode == "bounded" else None
+        )
         if permission_mode == "unrestricted":
             # Carry the manifest into unrestricted too. It is optional here
             # (unlike bounded), but when the user declared one it still caps
@@ -2820,6 +2879,11 @@ class CuaDriverBackend(ComputerUseBackend):
         # element. Cleared whenever a fresh capture overwrites the
         # snapshot context.
         self._snapshot_tokens: Dict[int, str] = {}
+        # The latest public capture's complete index -> AX element mapping.
+        # A bounded click policy validates against this exact map before
+        # dispatch, preventing a file line number or stale arbitrary integer
+        # from becoming desktop input.
+        self._snapshot_elements: Dict[int, UIElement] = {}
         # Cua Driver 0.22 also accepts the snapshot handle directly when an
         # element_token is unavailable. Keep it internal to the wrapper so the
         # public Hermes tool can retain its stable click(element=N) contract.
@@ -2958,6 +3022,7 @@ class CuaDriverBackend(ComputerUseBackend):
         self._last_app = None
         self._last_target = None
         self._snapshot_tokens = {}
+        self._snapshot_elements = {}
         self._snapshot_id = None
 
     def _failed_capture(self, mode: str, message: str = "") -> CaptureResult:
@@ -3369,6 +3434,7 @@ class CuaDriverBackend(ComputerUseBackend):
         # Tokens belong to the prior window snapshot. Disarm them before any
         # capture call so an exception cannot pair old tokens with this target.
         self._snapshot_tokens = {}
+        self._snapshot_elements = {}
         self._snapshot_id = None
         app_name = target["app_name"]
         # Record the resolved app name so capture_after= follow-ups can re-target
@@ -3551,6 +3617,7 @@ class CuaDriverBackend(ComputerUseBackend):
                 for e in elements
                 if e.element_token
             }
+            self._snapshot_elements = {e.index: e for e in elements}
             structured_capture = gws_out.get("structuredContent") or {}
             raw_snapshot_id = structured_capture.get("snapshot_id")
             self._snapshot_id = (
@@ -3717,6 +3784,83 @@ class CuaDriverBackend(ComputerUseBackend):
                                 message=f"unknown button {button!r} — expected left, right, middle.")
         tool = "double_click" if click_count == 2 else "click"
 
+        guarded_element: Optional[UIElement] = None
+        policy = self._bounded_click_targets
+        if policy:
+            if element is None:
+                if policy["deny_coordinate_clicks"]:
+                    return ActionResult(
+                        ok=False,
+                        action=tool,
+                        code="bounded_click_target_denied",
+                        message="Bounded click policy requires an element from the latest capture; coordinate clicks are denied.",
+                        meta={"refusal": {"code": "bounded_click_target_denied"}},
+                    )
+            else:
+                guarded_element = self._snapshot_elements.get(element)
+                if guarded_element is None:
+                    return ActionResult(
+                        ok=False,
+                        action=tool,
+                        code="bounded_click_target_denied",
+                        message=f"Element {element} is not present in the latest capture.",
+                        meta={"refusal": {"code": "bounded_click_target_denied"}},
+                    )
+                allowed_roles = policy["allowed_roles"]
+                if guarded_element.role not in allowed_roles:
+                    return ActionResult(
+                        ok=False,
+                        action=tool,
+                        code="bounded_click_target_denied",
+                        message=(
+                            f"Element {element} has role {guarded_element.role!r}; "
+                            f"bounded policy allows only {sorted(allowed_roles)}."
+                        ),
+                        meta={
+                            "refusal": {"code": "bounded_click_target_denied"},
+                            "target_element": {
+                                "index": guarded_element.index,
+                                "role": guarded_element.role,
+                                "label": guarded_element.label,
+                            },
+                        },
+                    )
+                label = guarded_element.label.strip()
+                if policy["require_nonempty_label"] and not label:
+                    return ActionResult(
+                        ok=False,
+                        action=tool,
+                        code="bounded_click_target_denied",
+                        message=f"Element {element} has no label; bounded policy requires a labelled target.",
+                        meta={
+                            "refusal": {"code": "bounded_click_target_denied"},
+                            "target_element": {
+                                "index": guarded_element.index,
+                                "role": guarded_element.role,
+                                "label": guarded_element.label,
+                            },
+                        },
+                    )
+                allowed_labels = policy["allowed_labels_by_role"].get(guarded_element.role)
+                if allowed_labels is not None and label not in allowed_labels:
+                    return ActionResult(
+                        ok=False,
+                        action=tool,
+                        code="bounded_click_target_denied",
+                        message=(
+                            f"Element {element} label {label!r} is not permitted for role "
+                            f"{guarded_element.role!r}."
+                        ),
+                        meta={
+                            "refusal": {"code": "bounded_click_target_denied"},
+                            "target_element": {
+                                "index": guarded_element.index,
+                                "role": guarded_element.role,
+                                "label": guarded_element.label,
+                            },
+                        },
+                    )
+
         args: Dict[str, Any] = {"pid": pid, "button": button_norm}
         if element is not None:
             if self._active_window_id is None:
@@ -3737,7 +3881,20 @@ class CuaDriverBackend(ComputerUseBackend):
         if modifiers:
             args["modifier"] = modifiers
 
-        return self._run_input_action(tool, args, delivery_mode, bring_to_front)
+        result = self._run_input_action(tool, args, delivery_mode, bring_to_front)
+        if guarded_element is not None:
+            result.meta["target_element"] = {
+                "index": guarded_element.index,
+                "role": guarded_element.role,
+                "label": guarded_element.label,
+            }
+            # Any input may mutate the AX tree. Consume the capture even when
+            # delivery fails so a second click cannot reuse its index without
+            # an intervening exact-window capture.
+            self._snapshot_elements = {}
+            self._snapshot_tokens = {}
+            self._snapshot_id = None
+        return result
 
     def drag(
         self,
