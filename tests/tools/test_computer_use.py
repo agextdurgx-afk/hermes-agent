@@ -2248,6 +2248,7 @@ class TestElementTokenAttachment:
                 return cap in capabilities.get(tool, set())
             return any(cap in caps for caps in capabilities.values())
         backend._session.supports_capability = _supports
+        backend._session.supports_input_property = lambda tool, prop: False
         backend._active_pid = 111
         backend._active_window_id = 222
         return backend
@@ -2263,6 +2264,32 @@ class TestElementTokenAttachment:
         assert args["element_index"] == 5
         # The matching token rode along — cua-driver will prefer it.
         assert args["element_token"] == "s0001:5"
+
+    def test_snapshot_id_attached_when_capture_has_no_element_tokens(self):
+        """Cua Driver 0.22 can require snapshot_id + element_index when the
+        structured capture carries no per-element tokens."""
+        backend = self._backend_with_session({"click": set()})
+        backend._session.supports_input_property = (
+            lambda tool, prop: tool == "click" and prop == "snapshot_id"
+        )
+        backend._snapshot_id = "sdeadbeef"
+
+        backend.click(element=5, button="left")
+
+        name, args = backend._session.call_tool.call_args.args
+        assert name == "click"
+        assert args["element_index"] == 5
+        assert args["snapshot_id"] == "sdeadbeef"
+        assert "element_token" not in args
+
+    def test_snapshot_id_is_not_sent_to_an_older_driver_schema(self):
+        backend = self._backend_with_session({"click": set()})
+        backend._snapshot_id = "sdeadbeef"
+
+        backend.click(element=5, button="left")
+
+        _, args = backend._session.call_tool.call_args.args
+        assert "snapshot_id" not in args
 
 
     def test_capture_refreshes_snapshot_tokens(self):
@@ -2291,7 +2318,7 @@ class TestElementTokenAttachment:
                 return {
                     "data": '✅ Demo — 2 elements, turn 1\n',
                     "images": [], "image_mime_types": [],
-                    "structuredContent": {"elements": [
+                    "structuredContent": {"snapshot_id": "s1234abcd", "elements": [
                         {"element_index": 1, "role": "AXButton", "label": "OK",
                          "element_token": "snap2:1"},
                         {"element_index": 2, "role": "AXButton", "label": "X",
@@ -2307,6 +2334,7 @@ class TestElementTokenAttachment:
 
         # Stale 99 token is gone; only the two new tokens remain.
         assert backend._snapshot_tokens == {1: "snap2:1", 2: "snap2:2"}
+        assert backend._snapshot_id == "s1234abcd"
 
 
 class TestSessionLifecycle:

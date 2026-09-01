@@ -2820,6 +2820,10 @@ class CuaDriverBackend(ComputerUseBackend):
         # element. Cleared whenever a fresh capture overwrites the
         # snapshot context.
         self._snapshot_tokens: Dict[int, str] = {}
+        # Cua Driver 0.22 also accepts the snapshot handle directly when an
+        # element_token is unavailable. Keep it internal to the wrapper so the
+        # public Hermes tool can retain its stable click(element=N) contract.
+        self._snapshot_id: Optional[str] = None
         # Per-instance public cua-driver session label. The MCP transport owns
         # the private lifecycle and releases it when the connection closes.
         # start_session/end_session attach this stable label to cursor,
@@ -2954,6 +2958,7 @@ class CuaDriverBackend(ComputerUseBackend):
         self._last_app = None
         self._last_target = None
         self._snapshot_tokens = {}
+        self._snapshot_id = None
 
     def _failed_capture(self, mode: str, message: str = "") -> CaptureResult:
         """Return an empty capture after disarming any prior target context."""
@@ -3364,6 +3369,7 @@ class CuaDriverBackend(ComputerUseBackend):
         # Tokens belong to the prior window snapshot. Disarm them before any
         # capture call so an exception cannot pair old tokens with this target.
         self._snapshot_tokens = {}
+        self._snapshot_id = None
         app_name = target["app_name"]
         # Record the resolved app name so capture_after= follow-ups can re-target
         # the same app rather than falling back to the frontmost window.
@@ -3545,6 +3551,13 @@ class CuaDriverBackend(ComputerUseBackend):
                 for e in elements
                 if e.element_token
             }
+            structured_capture = gws_out.get("structuredContent") or {}
+            raw_snapshot_id = structured_capture.get("snapshot_id")
+            self._snapshot_id = (
+                raw_snapshot_id
+                if isinstance(raw_snapshot_id, str) and raw_snapshot_id
+                else None
+            )
 
             # Image may arrive as an MCP image part or inside
             # structuredContent (screenshot_png_b64) depending on the driver
@@ -3927,6 +3940,7 @@ class CuaDriverBackend(ComputerUseBackend):
             self._active_pid = exact_pid
             self._active_window_id = target["window_id"]
             self._snapshot_tokens = {}
+            self._snapshot_id = None
             self._last_app = target.get("app_name") or self._last_app
             self._last_target = {"pid": exact_pid, "window_id": target["window_id"]}
         return windows
@@ -3991,6 +4005,7 @@ class CuaDriverBackend(ComputerUseBackend):
             self._active_pid = target["pid"]
             self._active_window_id = target["window_id"]
             self._snapshot_tokens = {}
+            self._snapshot_id = None
             self._last_app = target["app_name"] or app  # retained for back-compat diagnostics
             self._last_target = {
                 "pid": self._active_pid,
@@ -4226,6 +4241,7 @@ class CuaDriverBackend(ComputerUseBackend):
                 self._active_pid = pid
                 self._active_window_id = target["window_id"]
                 self._snapshot_tokens = {}
+                self._snapshot_id = None
                 self._last_app = target.get("app_name") or result.get("name") or name or bundle_id
                 self._last_target = {
                     "pid": self._active_pid,
@@ -4535,6 +4551,27 @@ class CuaDriverBackend(ComputerUseBackend):
             return
         args["element_token"] = token
 
+    def _maybe_attach_snapshot_id(self, tool: str, args: Dict[str, Any]) -> None:
+        """Attach the current capture handle for element-index actions.
+
+        Cua Driver 0.22 requires either ``element_token`` or the matching
+        ``snapshot_id`` plus ``element_index``. Some capture transports expose
+        only ``snapshot_id`` in structuredContent, so relying exclusively on
+        element tokens makes every otherwise-valid click fail closed. The
+        driver schema remains the compatibility gate: older versions never
+        receive an unknown field.
+        """
+        if "element_token" in args:
+            return
+        if not isinstance(args.get("element_index"), int):
+            return
+        snapshot_id = self._snapshot_id
+        if not snapshot_id:
+            return
+        if not self._session.supports_input_property(tool, "snapshot_id"):
+            return
+        args["snapshot_id"] = snapshot_id
+
     def _action(
         self,
         name: str,
@@ -4545,6 +4582,7 @@ class CuaDriverBackend(ComputerUseBackend):
         # Attach the snapshot's element_token whenever the call carries
         # an element_index and the target tool advertises support.
         self._maybe_attach_element_token(name, args)
+        self._maybe_attach_snapshot_id(name, args)
         # Carry this run's session id so the cua-driver agent cursor
         # and per-session state (config overrides, recording ownership)
         # stay tied to this run. setdefault preserves any explicit
