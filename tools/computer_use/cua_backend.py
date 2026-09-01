@@ -2807,6 +2807,7 @@ class CuaDriverBackend(ComputerUseBackend):
         # eligible for exact window recovery and process close. Redirected or
         # reused application processes are deliberately never killable.
         self._isolated_launch_pid: Optional[int] = None
+        self._isolated_launch_process: Optional[subprocess.Popen] = None
         self._last_app: Optional[str] = None  # last app name targeted via capture/focus_app
         # Exact identity for capture_after. App names may be generic on Linux
         # (for example, multiple unrelated Qt windows can say Qt6Application).
@@ -4098,6 +4099,7 @@ class CuaDriverBackend(ComputerUseBackend):
             if isolated_pid is None:
                 raise RuntimeError("isolated Firefox launch did not return a positive PID")
             self._isolated_launch_pid = isolated_pid
+            self._isolated_launch_process = process
             self._last_app = "Firefox"
             return {
                 "pid": isolated_pid,
@@ -4237,6 +4239,34 @@ class CuaDriverBackend(ComputerUseBackend):
         exact_pid = _positive_int(pid)
         if exact_pid is None or exact_pid != self._isolated_launch_pid:
             raise ValueError("kill_app is limited to the exact isolated launch PID")
+        if (
+            self._isolated_launch_process is not None
+            and _positive_int(self._isolated_launch_process.pid) == exact_pid
+        ):
+            process = self._isolated_launch_process
+            try:
+                if process.poll() is None:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait(timeout=5)
+            except (OSError, subprocess.SubprocessError) as exc:
+                return ActionResult(
+                    ok=False,
+                    action="kill_app",
+                    message=f"failed to close exact isolated launch PID {exact_pid}: {exc}",
+                )
+            self._isolated_launch_process = None
+            self._isolated_launch_pid = None
+            if self._active_pid == exact_pid:
+                self._clear_active_target()
+            return ActionResult(
+                ok=True,
+                action="kill_app",
+                message=f"closed exact isolated launch PID {exact_pid}",
+            )
         result = self._action("kill_app", {"pid": exact_pid})
         if result.ok:
             self._isolated_launch_pid = None

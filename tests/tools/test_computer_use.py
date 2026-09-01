@@ -2578,6 +2578,7 @@ class TestCuaToolCoverageExpansion:
         assert result["isolated_process_pid"] == 777
         assert result["direct_isolated_launch"] is True
         assert backend._isolated_launch_pid == 777
+        assert backend._isolated_launch_process is process
         backend._session.call_tool.assert_not_called()
         argv = popen.call_args.args[0]
         assert argv == [
@@ -2587,6 +2588,23 @@ class TestCuaToolCoverageExpansion:
         ]
         assert popen.call_args.kwargs["env"]["MOZ_NO_REMOTE"] == "1"
         assert popen.call_args.kwargs["env"]["MOZ_DBUS_REMOTE"] == "0"
+
+    def test_kill_app_closes_only_the_direct_isolated_child_without_driver_escalation(self):
+        backend = self._backend()
+        process = MagicMock(pid=777)
+        process.poll.return_value = None
+        backend._isolated_launch_pid = 777
+        backend._isolated_launch_process = process
+
+        result = backend.kill_app(pid=777)
+
+        assert result.ok is True
+        assert "exact isolated launch PID 777" in result.message
+        process.terminate.assert_called_once_with()
+        process.wait.assert_called_once_with(timeout=5)
+        backend._session.call_tool.assert_not_called()
+        assert backend._isolated_launch_pid is None
+        assert backend._isolated_launch_process is None
 
     # ── Pointer + display introspection ─────────────────────────
 
