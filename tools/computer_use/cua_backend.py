@@ -4057,6 +4057,61 @@ class CuaDriverBackend(ComputerUseBackend):
             args["additional_arguments"] = list(additional_arguments)
         if creates_new_application_instance:
             args["creates_new_application_instance"] = True
+        # macOS LaunchServices may still route Firefox URLs into an existing
+        # process even when the driver requests a new application instance.
+        # For the explicit Firefox isolation contract, launch the reviewed
+        # bundle executable directly with Mozilla's no-remote environment.
+        # This branch is intentionally exact and cannot become a generic
+        # command runner: it accepts only Firefox, a new instance, and the
+        # full -new-instance/-no-remote/-profile/-private-window shape.
+        direct_firefox_args = list(additional_arguments or [])
+        direct_firefox = (
+            sys.platform == "darwin"
+            and bundle_id == "org.mozilla.firefox"
+            and creates_new_application_instance
+            and len(direct_firefox_args) == 6
+            and direct_firefox_args[0] == "-new-instance"
+            and direct_firefox_args[1] == "-no-remote"
+            and direct_firefox_args[2] == "-profile"
+            and os.path.isabs(direct_firefox_args[3])
+            and direct_firefox_args[4] == "-private-window"
+            and str(direct_firefox_args[5]).startswith("https://")
+        )
+        if direct_firefox:
+            firefox_executable = "/Applications/Firefox.app/Contents/MacOS/firefox"
+            if not os.path.isfile(firefox_executable):
+                raise RuntimeError(f"isolated Firefox executable is missing: {firefox_executable}")
+            from tools.environments.local import _sanitize_subprocess_env
+
+            launch_env = _sanitize_subprocess_env(cua_driver_child_env())
+            launch_env["MOZ_NO_REMOTE"] = "1"
+            launch_env["MOZ_DBUS_REMOTE"] = "0"
+            process = subprocess.Popen(
+                [firefox_executable, *direct_firefox_args],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                env=launch_env,
+                start_new_session=True,
+            )
+            isolated_pid = _positive_int(process.pid)
+            if isolated_pid is None:
+                raise RuntimeError("isolated Firefox launch did not return a positive PID")
+            self._isolated_launch_pid = isolated_pid
+            self._last_app = "Firefox"
+            return {
+                "pid": isolated_pid,
+                "isolated_process_pid": isolated_pid,
+                "bundle_id": bundle_id,
+                "name": "firefox",
+                "windows": [],
+                "launch_state": {
+                    "requested": True,
+                    "process_running": True,
+                    "window_ready": False,
+                },
+                "direct_isolated_launch": True,
+            }
         # Snapshot only this exact application's windows before launch. This
         # handles single-instance apps (notably Firefox), which may redirect a
         # new private window to an existing process and let the helper PID

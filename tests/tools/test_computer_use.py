@@ -2555,6 +2555,39 @@ class TestCuaToolCoverageExpansion:
         assert backend._active_window_id == 11
         assert backend._isolated_launch_pid == 999
 
+    def test_launch_app_directly_starts_exact_isolated_firefox_contract_on_macos(self):
+        backend = self._backend()
+        process = MagicMock(pid=777)
+        profile = "/tmp/tezoff-refresh/run/browser-profiles/order/collector"
+
+        with patch("tools.computer_use.cua_backend.sys.platform", "darwin"), patch(
+            "tools.computer_use.cua_backend.os.path.isfile", return_value=True,
+        ), patch(
+            "tools.computer_use.cua_backend.subprocess.Popen", return_value=process,
+        ) as popen:
+            result = backend.launch_app(
+                bundle_id="org.mozilla.firefox",
+                creates_new_application_instance=True,
+                additional_arguments=[
+                    "-new-instance", "-no-remote", "-profile", profile,
+                    "-private-window", "https://technofino.in/community/whats-new/posts/",
+                ],
+            )
+
+        assert result["pid"] == 777
+        assert result["isolated_process_pid"] == 777
+        assert result["direct_isolated_launch"] is True
+        assert backend._isolated_launch_pid == 777
+        backend._session.call_tool.assert_not_called()
+        argv = popen.call_args.args[0]
+        assert argv == [
+            "/Applications/Firefox.app/Contents/MacOS/firefox",
+            "-new-instance", "-no-remote", "-profile", profile,
+            "-private-window", "https://technofino.in/community/whats-new/posts/",
+        ]
+        assert popen.call_args.kwargs["env"]["MOZ_NO_REMOTE"] == "1"
+        assert popen.call_args.kwargs["env"]["MOZ_DBUS_REMOTE"] == "0"
+
     # ── Pointer + display introspection ─────────────────────────
 
 
