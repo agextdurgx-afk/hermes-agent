@@ -32,6 +32,11 @@ class TestGetToolset:
         assert ts is not None
         assert "web_search" in ts["tools"]
 
+    def test_web_extract_only_toolset_excludes_search(self):
+        tools = resolve_toolset("web_extract_only")
+        assert tools == ["web_extract"]
+        assert "web_search" not in tools
+
     def test_x_search_toolset_marks_read_only_and_points_to_xurl(self):
         ts = get_toolset("x_search")
         assert ts is not None
@@ -355,4 +360,3 @@ class TestResolveToolsetMemo:
         second = resolve_toolset("hermes-cli", include_registry=False)
         assert first == second
         assert first  # non-empty sanity
-

@@ -107,6 +107,12 @@ TOOLSETS = {
         "tools": ["web_search", "web_extract"],
         "includes": []  # No other toolsets included
     },
+
+    "web_extract_only": {
+        "description": "URL-bounded content extraction without web search",
+        "tools": ["web_extract"],
+        "includes": []
+    },
     
     "search": {
         "description": "Web search only (no content extraction/scraping)",
