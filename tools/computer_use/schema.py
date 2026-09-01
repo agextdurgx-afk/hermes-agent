@@ -84,6 +84,20 @@ COMPUTER_USE_SCHEMA: Dict[str, Any] = {
                     "for text-only models)."
                 ),
             },
+            "element_roles": {
+                "type": "array",
+                "items": {"type": "string"},
+                "minItems": 1,
+                "maxItems": 16,
+                "description": (
+                    "Optional capture-only accessibility-role filter, for "
+                    "example ['AXLink'] or ['AXLink', 'AXButton', "
+                    "'AXTextField']. Filtering happens before the fixed "
+                    "response cap and preserves each element's original "
+                    "click index. Use it to inspect dense AX trees without "
+                    "loading or searching the full spill file."
+                ),
+            },
             "app": {
                 "type": "string",
                 "description": (

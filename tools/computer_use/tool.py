@@ -718,6 +718,15 @@ def _dispatch(backend: ComputerUseBackend, action: str, args: Dict[str, Any]) ->
         mode = str(args.get("mode", "som"))
         if mode not in {"som", "vision", "ax"}:
             return json.dumps({"error": f"bad mode {mode!r}; use som|vision|ax"})
+        element_roles = args.get("element_roles")
+        if element_roles is not None and (
+            not isinstance(element_roles, list)
+            or not 1 <= len(element_roles) <= 16
+            or not all(isinstance(role, str) and role.strip() for role in element_roles)
+        ):
+            return json.dumps({
+                "error": "capture `element_roles` must be an array of 1-16 non-empty strings",
+            })
         capture_kwargs: Dict[str, Any] = {"mode": mode, "app": args.get("app")}
         if args.get("pid") is not None or args.get("window_id") is not None:
             capture_kwargs.update({
@@ -725,7 +734,10 @@ def _dispatch(backend: ComputerUseBackend, action: str, args: Dict[str, Any]) ->
                 "window_id": args.get("window_id"),
             })
         cap = backend.capture(**capture_kwargs)
-        return _capture_response(cap)
+        return _capture_response(
+            cap,
+            element_roles=[role.strip() for role in element_roles] if element_roles else None,
+        )
 
     if action == "wait":
         seconds = float(args.get("seconds", 1.0))
@@ -1067,9 +1079,17 @@ def _image_dimensions_from_b64(image_b64: str) -> Optional[Tuple[int, int]]:
     return None
 
 
-def _capture_response(cap: CaptureResult, max_elements: int = _DEFAULT_MAX_ELEMENTS) -> Any:
-    total_elements = len(cap.elements)
-    visible_elements = cap.elements[:max_elements]
+def _capture_response(
+    cap: CaptureResult,
+    max_elements: int = _DEFAULT_MAX_ELEMENTS,
+    element_roles: Optional[List[str]] = None,
+) -> Any:
+    selected_elements = cap.elements
+    if element_roles:
+        allowed_roles = set(element_roles)
+        selected_elements = [element for element in cap.elements if element.role in allowed_roles]
+    total_elements = len(selected_elements)
+    visible_elements = selected_elements[:max_elements]
     truncated_elements = max(0, total_elements - len(visible_elements))
     image_dimensions = _image_dimensions_from_b64(cap.png_b64 or "") if cap.png_b64 else None
     response_width = image_dimensions[0] if image_dimensions else cap.width
@@ -1085,8 +1105,9 @@ def _capture_response(cap: CaptureResult, max_elements: int = _DEFAULT_MAX_ELEME
     # array), spill the complete tree to a cache file so the model can read or
     # grep the full text on demand instead of losing it entirely.
     elements_file = (
-        _spill_elements_to_file(cap)
-        if _capture_lost_detail(cap, visible_elements, truncated_elements)
+        (_spill_elements_to_file(cap, elements=selected_elements)
+         if element_roles else _spill_elements_to_file(cap))
+        if _capture_lost_detail(selected_elements, visible_elements, truncated_elements)
         else None
     )
     image_too_small = bool(
@@ -1113,6 +1134,8 @@ def _capture_response(cap: CaptureResult, max_elements: int = _DEFAULT_MAX_ELEME
         + (f" window={cap.window_title!r}" if cap.window_title else ""),
         f"{total_elements} interactable element(s):",
     ]
+    if element_roles:
+        summary_lines.append(f"  (filtered to accessibility roles: {', '.join(element_roles)})")
     if bounds_note:
         summary_lines.append(f"  ({bounds_note})")
     if screenshot_path:
@@ -1616,7 +1639,10 @@ def _persist_capture_image(cap: CaptureResult) -> Optional[str]:
         return None
 
 
-def _spill_elements_to_file(cap: CaptureResult) -> Optional[str]:
+def _spill_elements_to_file(
+    cap: CaptureResult,
+    elements: Optional[List[UIElement]] = None,
+) -> Optional[str]:
     """Write the FULL element tree (untruncated labels) to a cache file.
 
     The in-context response caps labels at ``_MAX_ELEMENT_LABEL_CHARS`` and
@@ -1649,10 +1675,11 @@ def _spill_elements_to_file(cap: CaptureResult) -> Optional[str]:
         except Exception:
             pass
         path = cache_dir / f"elements_{_uuid.uuid4().hex}.json"
+        selected_elements = cap.elements if elements is None else elements
         payload = {
             "app": cap.app,
             "window_title": cap.window_title,
-            "total_elements": len(cap.elements),
+            "total_elements": len(selected_elements),
             "elements": [
                 {
                     "index": e.index,
@@ -1661,7 +1688,7 @@ def _spill_elements_to_file(cap: CaptureResult) -> Optional[str]:
                     "bounds": list(e.bounds),
                     "app": e.app,
                 }
-                for e in cap.elements
+                for e in selected_elements
             ],
         }
         path.write_text(
@@ -1675,7 +1702,7 @@ def _spill_elements_to_file(cap: CaptureResult) -> Optional[str]:
 
 
 def _capture_lost_detail(
-    cap: CaptureResult, visible_elements: List[UIElement], truncated_elements: int,
+    selected_elements: List[UIElement], visible_elements: List[UIElement], truncated_elements: int,
 ) -> bool:
     """True when the in-context response drops information the full tree has."""
     if truncated_elements:

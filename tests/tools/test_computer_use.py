@@ -57,6 +57,7 @@ class TestSchema:
         """
         from tools.computer_use.schema import COMPUTER_USE_SCHEMA
         assert "max_elements" not in COMPUTER_USE_SCHEMA["parameters"]["properties"]
+        assert "element_roles" in COMPUTER_USE_SCHEMA["parameters"]["properties"]
 
 
 class TestRegistration:
@@ -446,6 +447,33 @@ class TestCaptureResponse:
         assert parsed["truncated_elements"] == 5000 - cu_tool._DEFAULT_MAX_ELEMENTS
         # The full tree is spilled so nothing is lost.
         assert parsed.get("elements_file")
+
+    def test_capture_ax_filters_roles_before_the_fixed_response_cap(self):
+        from tools.computer_use.backend import CaptureResult, UIElement
+        from tools.computer_use import tool as cu_tool
+
+        elements = [
+            UIElement(index=i + 1, role="AXStaticText", label=f"copy-{i}", bounds=(0, 0, 1, 1))
+            for i in range(250)
+        ] + [
+            UIElement(index=501 + i, role="AXLink", label=f"thread-{i}", bounds=(0, 0, 1, 1))
+            for i in range(20)
+        ]
+
+        class FakeBackend:
+            def capture(self, mode="som", app=None):
+                return CaptureResult(mode=mode, width=800, height=600, png_b64="", elements=elements, app="Firefox")
+
+        with patch.object(cu_tool, "_get_backend", return_value=FakeBackend()):
+            out = cu_tool.handle_computer_use({"action": "capture", "mode": "ax", "element_roles": ["AXLink"]})
+
+        parsed = json.loads(out)
+        assert parsed["total_elements"] == 20
+        assert len(parsed["elements"]) == 20
+        assert parsed["elements"][0]["index"] == 501
+        assert {row["role"] for row in parsed["elements"]} == {"AXLink"}
+        assert "elements_file" not in parsed
+        assert "filtered to accessibility roles: AXLink" in parsed["summary"]
 
 class TestCuaCaptureImageDimensions:
     def test_png_dimensions_are_sniffed_from_image_bytes(self):
