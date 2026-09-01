@@ -2549,9 +2549,11 @@ class TestCuaToolCoverageExpansion:
             )
 
         assert result["pid"] == 38436
+        assert result["isolated_process_pid"] == 999
         assert [window["window_id"] for window in result["windows"]] == [11]
         assert backend._active_pid == 38436
         assert backend._active_window_id == 11
+        assert backend._isolated_launch_pid == 999
 
     # ── Pointer + display introspection ─────────────────────────
 

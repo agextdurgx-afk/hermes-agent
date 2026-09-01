@@ -112,6 +112,10 @@ If a valid new-instance launch returns a PID but no window because first-run
 startup is still in progress, wait and use `list_windows_for_pid` with that
 exact PID. Never substitute a different PID. Close the isolated process with
 `kill_app` when the bounded task ends.
+If an application redirects into an existing process, do not inspect or close
+that existing process. When the launch response includes
+`isolated_process_pid`, close only that newly created helper PID with
+`kill_app` before failing closed.
 
 The input actions (`click`, `double_click`, `right_click`, `middle_click`,
 `drag`, `scroll`, `type`, `key`) also accept `delivery_mode`. The optional

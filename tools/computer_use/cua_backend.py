@@ -4080,6 +4080,20 @@ class CuaDriverBackend(ComputerUseBackend):
 
         out = self._session.call_tool("launch_app", args)
         result = out["structuredContent"] or {"data": out["data"]}
+        launched_pid = _positive_int(result.get("pid")) if isinstance(result, dict) else None
+        isolated_process_pid = (
+            launched_pid
+            if creates_new_application_instance
+            and launched_pid is not None
+            and launched_pid not in prior_window_ids
+            else None
+        )
+        if isinstance(result, dict) and isolated_process_pid is not None:
+            # Preserve the new process identity even if Firefox later routes
+            # the requested URL into an old process/window. The model must not
+            # inspect or terminate that old process, but it still needs a safe
+            # exact handle for closing the helper it launched.
+            result["isolated_process_pid"] = isolated_process_pid
         if (
             isinstance(result, dict)
             and not result.get("windows")
@@ -4147,14 +4161,7 @@ class CuaDriverBackend(ComputerUseBackend):
                 result["reused_private_window"] = True
         if isinstance(result, dict):
             pid = _positive_int(result.get("pid"))
-            self._isolated_launch_pid = (
-                pid
-                if creates_new_application_instance
-                and pid is not None
-                and result.get("redirected_to_existing_process") is not True
-                and result.get("reused_private_window") is not True
-                else None
-            )
+            self._isolated_launch_pid = isolated_process_pid
             windows = _ingest_windows(result.get("windows") or [])
             windows.sort(key=lambda window: window["z_index"], reverse=True)
             target = windows[0] if windows else None
