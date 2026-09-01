@@ -59,6 +59,7 @@ COMPUTER_USE_SCHEMA: Dict[str, Any] = {
                     "list_windows",
                     "list_windows_for_pid",
                     "focus_app",
+                    "bring_to_front",
                     "launch_app",
                     "kill_app",
                 ],
@@ -130,9 +131,9 @@ COMPUTER_USE_SCHEMA: Dict[str, Any] = {
             "window_id": {
                 "type": "integer",
                 "description": (
-                    "Optional exact native window target for action='capture'. "
-                    "Pair with pid when an external cua-driver list_windows "
-                    "lookup has already identified the window."
+                    "Optional exact native window target for action='capture' "
+                    "or action='bring_to_front'. Pair with pid when an external "
+                    "cua-driver list_windows lookup has already identified the window."
                 ),
             },
             # ── click / drag / scroll targeting ────────────────────

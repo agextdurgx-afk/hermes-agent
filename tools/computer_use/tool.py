@@ -86,7 +86,7 @@ _SAFE_ACTIONS = frozenset({
 _DESTRUCTIVE_ACTIONS = frozenset({
     "click", "double_click", "right_click", "middle_click",
     "drag", "scroll", "type", "key", "set_value", "focus_app", "launch_app",
-    "kill_app",
+    "kill_app", "bring_to_front",
 })
 
 # Hard-blocked key combinations. Mirrored from #4562 — these are destructive
@@ -788,6 +788,17 @@ def _dispatch(backend: ComputerUseBackend, action: str, args: Dict[str, Any]) ->
         if not hasattr(backend, "kill_app"):
             return json.dumps({"error": "the active computer_use backend does not support kill_app"})
         return _text_response(backend.kill_app(pid=pid))
+
+    if action == "bring_to_front":
+        pid = args.get("pid")
+        window_id = args.get("window_id")
+        if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+            return json.dumps({"error": "bring_to_front requires a positive integer `pid`"})
+        if not isinstance(window_id, int) or isinstance(window_id, bool) or window_id <= 0:
+            return json.dumps({"error": "bring_to_front requires a positive integer `window_id`"})
+        if not hasattr(backend, "bring_to_front"):
+            return json.dumps({"error": "the active computer_use backend does not support bring_to_front"})
+        return _text_response(backend.bring_to_front(pid=pid, window_id=window_id))
 
     # delivery_mode / bring_to_front thread through every input action so the
     # model can escalate background → foreground per cua-driver's ladder.

@@ -47,7 +47,7 @@ class TestSchema:
         assert actions >= {
             "capture", "click", "double_click", "right_click", "middle_click",
             "drag", "scroll", "type", "key", "wait", "list_apps", "list_windows",
-            "list_windows_for_pid", "focus_app", "launch_app", "kill_app",
+            "list_windows_for_pid", "focus_app", "bring_to_front", "launch_app", "kill_app",
         }
 
     def test_schema_no_longer_advertises_max_elements(self):
@@ -147,6 +147,24 @@ class TestDispatch:
 
         assert parsed["ok"] is True
         backend.kill_app.assert_called_once_with(pid=321)
+
+    def test_bring_to_front_routes_only_an_exact_pid_window_pair(self):
+        from tools.computer_use.backend import ActionResult
+        from tools.computer_use.tool import handle_computer_use
+
+        backend = MagicMock()
+        backend.bring_to_front.return_value = ActionResult(ok=True, action="bring_to_front")
+        with patch("tools.computer_use.tool._get_backend", return_value=backend):
+            parsed = json.loads(handle_computer_use({
+                "action": "bring_to_front", "pid": 321, "window_id": 654,
+            }))
+            missing_window = json.loads(handle_computer_use({
+                "action": "bring_to_front", "pid": 321,
+            }))
+
+        assert parsed["ok"] is True
+        backend.bring_to_front.assert_called_once_with(pid=321, window_id=654)
+        assert "window_id" in missing_window["error"]
 
 
     def test_type_action_routes_to_type_text_backend(self, noop_backend):
