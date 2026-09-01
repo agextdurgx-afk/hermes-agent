@@ -2689,7 +2689,9 @@ class TestCuaToolCoverageExpansion:
             "tools.computer_use.cua_backend.os.path.isfile", return_value=True,
         ), patch(
             "tools.computer_use.cua_backend.subprocess.Popen", return_value=process,
-        ) as popen:
+        ) as popen, patch(
+            "tools.computer_use.cua_backend._spawn_owner_guard", return_value=MagicMock(),
+        ):
             result = backend.launch_app(
                 bundle_id="org.mozilla.firefox",
                 creates_new_application_instance=True,

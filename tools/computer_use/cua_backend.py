@@ -800,6 +800,76 @@ def _embedded_daemon_spawn_command(
     ]
 
 
+def _spawn_owner_guard(
+    *,
+    target_pid: Optional[int] = None,
+    driver_cmd: Optional[str] = None,
+    socket_path: Optional[str] = None,
+) -> Optional[subprocess.Popen]:
+    """Watch a detached macOS resource and close it if this owner dies.
+
+    Kanban termination deliberately uses ``os._exit``.  LaunchServices also
+    reparents the signed CuaDriver app immediately, while isolated Firefox is
+    launched in its own process group.  The normal atexit path therefore
+    cannot be the only lifetime boundary.
+    """
+    if sys.platform != "darwin":
+        return None
+    if (target_pid is None) == (not driver_cmd or not socket_path):
+        raise ValueError("owner guard requires exactly one target mode")
+    helper = os.path.join(os.path.dirname(__file__), "owner_guard.py")
+    owner_pid = os.getpid()
+    from tools.computer_use.owner_guard import process_start_token
+    from tools.environments.local import _sanitize_subprocess_env
+
+    owner_start = process_start_token(owner_pid)
+    if not owner_start:
+        raise RuntimeError("computer-use owner guard could not bind the owner process birth token")
+    command = [
+        sys.executable,
+        helper,
+        "--owner-pid",
+        str(owner_pid),
+        "--owner-start",
+        owner_start,
+    ]
+    if target_pid is not None:
+        command.extend(["--target-pid", str(int(target_pid))])
+    else:
+        command.extend(["--driver", str(driver_cmd), "--socket", str(socket_path)])
+    process = subprocess.Popen(
+        command,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        env=_sanitize_subprocess_env(cua_driver_child_env()),
+    )
+    # Fail closed if argument/path validation rejected the guard immediately.
+    time.sleep(0.05)
+    code = process.poll()
+    if code is not None:
+        raise RuntimeError(f"computer-use owner guard exited during startup ({code})")
+    return process
+
+
+def _stop_owner_guard(process: Optional[subprocess.Popen]) -> None:
+    if process is None:
+        return
+    try:
+        if process.poll() is None:
+            process.terminate()
+        process.wait(timeout=2.0)
+    except subprocess.TimeoutExpired:
+        try:
+            process.kill()
+            process.wait(timeout=2.0)
+        except (OSError, subprocess.SubprocessError):
+            pass
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
 class _EmbeddedCuaDaemon:
     """Private daemon for a non-standard permission mode.
 
@@ -876,6 +946,7 @@ class _EmbeddedCuaDaemon:
         self._launch_via_app = False
         self._stderr_tail: deque[str] = deque(maxlen=20)
         self._stderr_thread: Optional[threading.Thread] = None
+        self._owner_guard: Optional[subprocess.Popen] = None
         token = uuid.uuid4().hex[:12]
         if sys.platform == "win32":
             self.socket_path = rf"\\.\pipe\hermes-cua-{token}"
@@ -992,6 +1063,10 @@ class _EmbeddedCuaDaemon:
                 probe = None
             if probe is not None and probe.returncode == 0:
                 self._running = True
+                self._owner_guard = _spawn_owner_guard(
+                    driver_cmd=self._command,
+                    socket_path=self.socket_path,
+                )
                 return
             time.sleep(0.1)
 
@@ -1010,6 +1085,8 @@ class _EmbeddedCuaDaemon:
         ]
 
     def stop(self) -> None:
+        owner_guard = self._owner_guard
+        self._owner_guard = None
         process = self._process
         self._process = None
         owns_runtime = self._owns_runtime
@@ -1044,6 +1121,7 @@ class _EmbeddedCuaDaemon:
                 os.remove(self.socket_path)
             except OSError:
                 pass
+        _stop_owner_guard(owner_guard)
 
 
 def _resolve_mcp_invocation(
@@ -2867,6 +2945,7 @@ class CuaDriverBackend(ComputerUseBackend):
         # reused application processes are deliberately never killable.
         self._isolated_launch_pid: Optional[int] = None
         self._isolated_launch_process: Optional[subprocess.Popen] = None
+        self._isolated_launch_guard: Optional[subprocess.Popen] = None
         self._last_app: Optional[str] = None  # last app name targeted via capture/focus_app
         # Exact identity for capture_after. App names may be generic on Linux
         # (for example, multiple unrelated Qt windows can say Qt6Application).
@@ -2987,6 +3066,11 @@ class CuaDriverBackend(ComputerUseBackend):
                     logger.debug("cua-driver set_agent_cursor_enabled failed: %s", e)
 
     def stop(self) -> None:
+        # Direct isolated Firefox is a separate process group and must not
+        # outlive this backend on ordinary teardown. The external owner guard
+        # covers os._exit/SIGKILL paths where this method cannot run.
+        if self._isolated_launch_process is not None:
+            self._terminate_direct_isolated_launch()
         # Tear the cua-driver session down before disconnecting so the
         # driver can clean up per-session state (cursor overlay, recording
         # ownership, config overrides). Best-effort — even if it fails,
@@ -3785,7 +3869,10 @@ class CuaDriverBackend(ComputerUseBackend):
         tool = "double_click" if click_count == 2 else "click"
 
         guarded_element: Optional[UIElement] = None
-        policy = self._bounded_click_targets
+        # Some long-lived callers and focused test harnesses construct the
+        # backend without re-running __init__. Treat absent optional bounded
+        # state as disabled instead of crashing an otherwise valid action.
+        policy = getattr(self, "_bounded_click_targets", None)
         if policy:
             if element is None:
                 if policy["deny_coordinate_clicks"]:
@@ -3797,7 +3884,7 @@ class CuaDriverBackend(ComputerUseBackend):
                         meta={"refusal": {"code": "bounded_click_target_denied"}},
                     )
             else:
-                guarded_element = self._snapshot_elements.get(element)
+                guarded_element = getattr(self, "_snapshot_elements", {}).get(element)
                 if guarded_element is None:
                     return ActionResult(
                         ok=False,
@@ -4270,8 +4357,19 @@ class CuaDriverBackend(ComputerUseBackend):
             isolated_pid = _positive_int(process.pid)
             if isolated_pid is None:
                 raise RuntimeError("isolated Firefox launch did not return a positive PID")
+            try:
+                guard = _spawn_owner_guard(target_pid=isolated_pid)
+            except Exception:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5)
+                raise
             self._isolated_launch_pid = isolated_pid
             self._isolated_launch_process = process
+            self._isolated_launch_guard = guard
             self._last_app = "Firefox"
             return {
                 "pid": isolated_pid,
@@ -4406,6 +4504,32 @@ class CuaDriverBackend(ComputerUseBackend):
                 }
         return result
 
+    def _terminate_direct_isolated_launch(self) -> Optional[str]:
+        process = self._isolated_launch_process
+        exact_pid = self._isolated_launch_pid
+        if process is None or exact_pid is None:
+            return None
+        error = None
+        try:
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5)
+        except (OSError, subprocess.SubprocessError) as exc:
+            error = str(exc)
+        if error:
+            return error
+        _stop_owner_guard(self._isolated_launch_guard)
+        self._isolated_launch_guard = None
+        self._isolated_launch_process = None
+        self._isolated_launch_pid = None
+        if self._active_pid == exact_pid:
+            self._clear_active_target()
+        return None
+
     def kill_app(self, *, pid: int) -> ActionResult:
         """Terminate by pid. Equivalent to ``kill -9`` on POSIX,
         ``taskkill /F`` on Windows."""
@@ -4416,25 +4540,13 @@ class CuaDriverBackend(ComputerUseBackend):
             self._isolated_launch_process is not None
             and _positive_int(self._isolated_launch_process.pid) == exact_pid
         ):
-            process = self._isolated_launch_process
-            try:
-                if process.poll() is None:
-                    process.terminate()
-                    try:
-                        process.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        process.kill()
-                        process.wait(timeout=5)
-            except (OSError, subprocess.SubprocessError) as exc:
+            error = self._terminate_direct_isolated_launch()
+            if error:
                 return ActionResult(
                     ok=False,
                     action="kill_app",
-                    message=f"failed to close exact isolated launch PID {exact_pid}: {exc}",
+                    message=f"failed to close exact isolated launch PID {exact_pid}: {error}",
                 )
-            self._isolated_launch_process = None
-            self._isolated_launch_pid = None
-            if self._active_pid == exact_pid:
-                self._clear_active_target()
             return ActionResult(
                 ok=True,
                 action="kill_app",
@@ -4699,7 +4811,7 @@ class CuaDriverBackend(ComputerUseBackend):
         idx = args.get("element_index")
         if not isinstance(idx, int):
             return
-        token = self._snapshot_tokens.get(idx)
+        token = getattr(self, "_snapshot_tokens", {}).get(idx)
         if not token:
             return
         if not self._session.supports_capability(
@@ -4722,7 +4834,7 @@ class CuaDriverBackend(ComputerUseBackend):
             return
         if not isinstance(args.get("element_index"), int):
             return
-        snapshot_id = self._snapshot_id
+        snapshot_id = getattr(self, "_snapshot_id", None)
         if not snapshot_id:
             return
         if not self._session.supports_input_property(tool, "snapshot_id"):

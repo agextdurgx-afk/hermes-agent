@@ -244,6 +244,11 @@ class TestEmbeddedDaemonOverlayFlag:
             cua_backend.subprocess, "Popen", return_value=process,
         ) as popen, patch.object(
             cua_backend.subprocess, "run", return_value=status,
+        ), patch.object(
+            cua_backend, "_embedded_daemon_spawn_command",
+            return_value=["/usr/bin/cua-driver", "serve", "--no-overlay"],
+        ), patch.object(
+            cua_backend, "_spawn_owner_guard", return_value=MagicMock(),
         ), patch.object(cua_backend.threading, "Thread"):
             daemon.start()
 
