@@ -79,13 +79,14 @@ def set_approval_callback(cb) -> None:
 
 # Actions that read, not mutate. Always allowed.
 _SAFE_ACTIONS = frozenset({
-    "capture", "wait", "list_apps", "list_windows",
+    "capture", "wait", "list_apps", "list_windows", "list_windows_for_pid",
 })
 
 # Actions that mutate user-visible state. Go through approval.
 _DESTRUCTIVE_ACTIONS = frozenset({
     "click", "double_click", "right_click", "middle_click",
-    "drag", "scroll", "type", "key", "set_value", "focus_app",
+    "drag", "scroll", "type", "key", "set_value", "focus_app", "launch_app",
+    "kill_app",
 })
 
 # Hard-blocked key combinations. Mirrored from #4562 — these are destructive
@@ -501,6 +502,10 @@ class _NoopBackend(ComputerUseBackend):  # pragma: no cover
         self.calls.append(("list_windows", {}))
         return []
 
+    def list_windows_for_pid(self, pid: int) -> List[Dict[str, Any]]:
+        self.calls.append(("list_windows_for_pid", {"pid": pid}))
+        return []
+
     def focus_app(self, app: str, raise_window: bool = False) -> ActionResult:
         self.calls.append(("focus_app", {"app": app, "raise": raise_window}))
         return ActionResult(ok=True, action="focus_app")
@@ -601,6 +606,41 @@ def _request_approval(action: str, args: Dict[str, Any],
     operation. State is keyed on session_id so concurrent runs don't leak
     unlocks into one another.
     """
+    # A reviewed bounded capability manifest is the approval boundary for
+    # repeatable unattended Computer Use.  Cua validates the manifest when the
+    # private runtime starts and denies every undeclared tool/resource, so a
+    # second interactive host prompt would only deadlock headless -q/Kanban
+    # workers.  A missing/invalid manifest still fails closed at backend start.
+    try:
+        from tools.computer_use.cua_backend import (
+            _cua_capability_manifest,
+            _cua_configured_permission_mode,
+        )
+
+        if (
+            _cua_configured_permission_mode() == "bounded"
+            and _cua_capability_manifest()
+        ):
+            return None
+    except Exception:
+        # Configuration resolution is safety-critical: fall through to the
+        # normal prompt when the bounded authorization cannot be established.
+        pass
+
+    # Keep Computer Use aligned with Hermes' canonical explicit bypass too.
+    # The backend maps --yolo/session-yolo/approvals.mode=off to an
+    # unrestricted runtime; a v3 manifest, when configured, remains a
+    # narrow-only ceiling.  Without a bypass or bounded manifest, prompt.
+    try:
+        from tools.approval import is_approval_bypass_active_for_session
+
+        if is_approval_bypass_active_for_session(session_id):
+            return None
+    except Exception:
+        # Approval resolution is safety-critical: any import/config failure
+        # falls through to the normal prompt instead of silently allowing.
+        pass
+
     is_foreground = args.get("delivery_mode") == "foreground"
     scope_key = (action, "foreground" if is_foreground else "background")
     with _approval_lock:
@@ -661,6 +701,13 @@ def _summarize_action(action: str, args: Dict[str, Any]) -> str:
         return f"key {args.get('keys', '')!r}{fg}"
     if action == "focus_app":
         return f"focus {args.get('app', '')!r}" + (" (raise)" if args.get("raise_window") else "")
+    if action == "launch_app":
+        target = args.get("bundle_id") or args.get("app") or ""
+        return f"launch {target!r}" + (" as a new instance" if args.get("creates_new_application_instance") else "")
+    if action == "list_windows_for_pid":
+        return f"list windows for exact pid {args.get('pid')}"
+    if action == "kill_app":
+        return f"close exact launched pid {args.get('pid')}"
     return action + fg
 
 
@@ -693,12 +740,54 @@ def _dispatch(backend: ComputerUseBackend, action: str, args: Dict[str, Any]) ->
         windows = backend.list_windows()
         return json.dumps({"windows": windows, "count": len(windows)})
 
+    if action == "list_windows_for_pid":
+        pid = args.get("pid")
+        if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+            return json.dumps({"error": "list_windows_for_pid requires a positive integer `pid`"})
+        if not hasattr(backend, "list_windows_for_pid"):
+            return json.dumps({"error": "the active computer_use backend does not support exact-pid window discovery"})
+        windows = backend.list_windows_for_pid(pid)
+        return json.dumps({"pid": pid, "windows": windows, "count": len(windows)})
+
     if action == "focus_app":
         app = args.get("app")
         if not app:
             return json.dumps({"error": "focus_app requires `app`"})
         res = backend.focus_app(app, raise_window=bool(args.get("raise_window")))
         return _maybe_follow_capture(backend, res, capture_after)
+
+    if action == "launch_app":
+        bundle_id = str(args.get("bundle_id") or "").strip() or None
+        name = str(args.get("app") or "").strip() or None
+        if not bundle_id and not name:
+            return json.dumps({"error": "launch_app requires `bundle_id` or `app`"})
+        urls = args.get("urls")
+        additional_arguments = args.get("additional_arguments")
+        if urls is not None and (not isinstance(urls, list) or not all(isinstance(value, str) for value in urls)):
+            return json.dumps({"error": "launch_app `urls` must be an array of strings"})
+        if additional_arguments is not None and (
+            not isinstance(additional_arguments, list)
+            or not all(isinstance(value, str) for value in additional_arguments)
+        ):
+            return json.dumps({"error": "launch_app `additional_arguments` must be an array of strings"})
+        if not hasattr(backend, "launch_app"):
+            return json.dumps({"error": "the active computer_use backend does not support launch_app"})
+        launched = backend.launch_app(
+            bundle_id=bundle_id,
+            name=name,
+            urls=urls,
+            additional_arguments=additional_arguments,
+            creates_new_application_instance=bool(args.get("creates_new_application_instance")),
+        )
+        return json.dumps(launched)
+
+    if action == "kill_app":
+        pid = args.get("pid")
+        if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+            return json.dumps({"error": "kill_app requires a positive integer `pid`"})
+        if not hasattr(backend, "kill_app"):
+            return json.dumps({"error": "the active computer_use backend does not support kill_app"})
+        return _text_response(backend.kill_app(pid=pid))
 
     # delivery_mode / bring_to_front thread through every input action so the
     # model can escalate background → foreground per cua-driver's ladder.

@@ -47,7 +47,7 @@ class TestSchema:
         assert actions >= {
             "capture", "click", "double_click", "right_click", "middle_click",
             "drag", "scroll", "type", "key", "wait", "list_apps", "list_windows",
-            "focus_app",
+            "list_windows_for_pid", "focus_app", "launch_app", "kill_app",
         }
 
     def test_schema_no_longer_advertises_max_elements(self):
@@ -95,6 +95,58 @@ class TestDispatch:
         out = handle_computer_use({"action": "nope"})
         parsed = json.loads(out)
         assert "error" in parsed
+
+    def test_launch_app_routes_exact_isolated_instance_arguments(self):
+        from tools.computer_use.tool import handle_computer_use
+
+        backend = MagicMock()
+        backend.launch_app.return_value = {
+            "pid": 321,
+            "name": "Firefox",
+            "windows": [{"pid": 321, "window_id": 654}],
+        }
+        with patch("tools.computer_use.tool._get_backend", return_value=backend):
+            parsed = json.loads(handle_computer_use({
+                "action": "launch_app",
+                "bundle_id": "org.mozilla.firefox",
+                "urls": ["https://technofino.in/community/whats-new/posts/"],
+                "additional_arguments": ["-private-window"],
+                "creates_new_application_instance": True,
+            }))
+
+        assert parsed["pid"] == 321
+        backend.launch_app.assert_called_once_with(
+            bundle_id="org.mozilla.firefox",
+            name=None,
+            urls=["https://technofino.in/community/whats-new/posts/"],
+            additional_arguments=["-private-window"],
+            creates_new_application_instance=True,
+        )
+
+    def test_list_windows_for_pid_routes_only_positive_pid(self):
+        from tools.computer_use.tool import handle_computer_use
+
+        backend = MagicMock()
+        backend.list_windows_for_pid.return_value = [{"pid": 321, "window_id": 654}]
+        with patch("tools.computer_use.tool._get_backend", return_value=backend):
+            parsed = json.loads(handle_computer_use({"action": "list_windows_for_pid", "pid": 321}))
+            invalid = json.loads(handle_computer_use({"action": "list_windows_for_pid", "pid": 0}))
+
+        assert parsed["count"] == 1
+        backend.list_windows_for_pid.assert_called_once_with(321)
+        assert "error" in invalid
+
+    def test_kill_app_routes_exact_pid(self):
+        from tools.computer_use.backend import ActionResult
+        from tools.computer_use.tool import handle_computer_use
+
+        backend = MagicMock()
+        backend.kill_app.return_value = ActionResult(ok=True, action="kill_app")
+        with patch("tools.computer_use.tool._get_backend", return_value=backend):
+            parsed = json.loads(handle_computer_use({"action": "kill_app", "pid": 321}))
+
+        assert parsed["ok"] is True
+        backend.kill_app.assert_called_once_with(pid=321)
 
 
     def test_type_action_routes_to_type_text_backend(self, noop_backend):
@@ -2358,6 +2410,148 @@ class TestCuaToolCoverageExpansion:
         import pytest
         with pytest.raises(ValueError, match="bundle_id or name"):
             backend.launch_app()
+
+    def test_launch_app_keeps_returned_window_as_exact_active_target(self):
+        backend = self._backend(structured={
+            "pid": 321,
+            "bundle_id": "org.mozilla.firefox",
+            "name": "Firefox",
+            "windows": [{
+                "app_name": "Firefox",
+                "pid": 321,
+                "window_id": 654,
+                "title": "Private Browsing",
+                "z_index": 8,
+                "is_on_screen": True,
+            }],
+        })
+
+        result = backend.launch_app(
+            bundle_id="org.mozilla.firefox",
+            urls=["https://technofino.in/community/whats-new/posts/"],
+            additional_arguments=["-private-window"],
+            creates_new_application_instance=True,
+        )
+
+        assert result["pid"] == 321
+        assert backend._active_pid == 321
+        assert backend._active_window_id == 654
+        assert backend._isolated_launch_pid == 321
+
+    def test_exact_pid_window_recovery_pins_only_the_isolated_launch(self):
+        import pytest
+
+        backend = self._backend(structured={
+            "windows": [{
+                "app_name": "Firefox",
+                "pid": 321,
+                "window_id": 654,
+                "title": "TechnoFino — Private Browsing",
+                "z_index": 8,
+                "is_on_screen": True,
+            }],
+        })
+        backend._isolated_launch_pid = 321
+
+        windows = backend.list_windows_for_pid(321)
+
+        assert [window["window_id"] for window in windows] == [654]
+        assert backend._active_pid == 321
+        assert backend._active_window_id == 654
+        backend._session.call_tool.assert_called_once_with(
+            "list_windows",
+            {"pid": 321, "on_screen_only": False, "session": backend._session_id},
+        )
+        with pytest.raises(ValueError, match="exact isolated launch PID"):
+            backend.list_windows_for_pid(38436)
+
+    def test_kill_app_refuses_any_pid_except_the_isolated_launch(self):
+        import pytest
+        from tools.computer_use.backend import ActionResult
+
+        backend = self._backend()
+        backend._isolated_launch_pid = 321
+        backend._action = MagicMock(return_value=ActionResult(ok=True, action="kill_app"))
+
+        with pytest.raises(ValueError, match="exact isolated launch PID"):
+            backend.kill_app(pid=38436)
+        result = backend.kill_app(pid=321)
+
+        assert result.ok is True
+        backend._action.assert_called_once_with("kill_app", {"pid": 321})
+        assert backend._isolated_launch_pid is None
+
+    def test_capture_reuses_launch_target_without_desktop_window_enumeration(self):
+        backend = self._backend(data='AXWindow "Private Browsing"')
+        backend._active_pid = 321
+        backend._active_window_id = 654
+        backend._last_app = "Firefox"
+        backend._load_windows = MagicMock(side_effect=AssertionError("must not enumerate desktop windows"))
+
+        backend.capture(mode="som")
+
+        backend._load_windows.assert_not_called()
+        assert backend._active_pid == 321
+        assert backend._active_window_id == 654
+
+    def test_capture_exact_active_app_reuses_target_but_other_app_does_not(self):
+        backend = self._backend(data='AXWindow "Private Browsing"')
+        backend._active_pid = 321
+        backend._active_window_id = 654
+        backend._last_app = "Firefox"
+        backend._load_windows = MagicMock(return_value=[])
+
+        backend.capture(mode="som", app="Firefox")
+        backend._load_windows.assert_not_called()
+
+        backend.capture(mode="som", app="Safari")
+        backend._load_windows.assert_called_once_with()
+
+    def test_focus_app_reuses_exact_active_target_without_window_enumeration(self):
+        backend = self._backend()
+        backend._active_pid = 321
+        backend._active_window_id = 654
+        backend._last_app = "Firefox"
+        backend._load_windows = MagicMock(side_effect=AssertionError("must not enumerate desktop windows"))
+
+        result = backend.focus_app("Firefox")
+
+        assert result.ok is True
+        assert "without window enumeration" in result.message
+        backend._load_windows.assert_not_called()
+        assert backend._last_app == "Firefox"
+
+    def test_launch_app_returns_only_new_window_when_firefox_redirects(self):
+        existing = {
+            "app_name": "Firefox", "pid": 38436, "window_id": 10,
+            "title": "Normal Firefox", "z_index": 1, "is_on_screen": True,
+        }
+        private = {
+            "app_name": "Firefox", "pid": 38436, "window_id": 11,
+            "title": "TechnoFino — Private Browsing", "z_index": 2,
+            "is_on_screen": True,
+        }
+        backend = self._backend()
+        backend._session.call_tool.side_effect = [
+            {"structuredContent": {"windows": [existing]}, "data": "", "isError": False},
+            {"structuredContent": {"pid": 999, "name": "firefox", "windows": []}, "data": "", "isError": False},
+            {"structuredContent": {"windows": [existing, private]}, "data": "", "isError": False},
+        ]
+
+        with patch("tools.computer_use.cua_backend.sys.platform", "darwin"), patch(
+            "tools.computer_use.cua_backend._macos_running_app_pids",
+            return_value=[38436],
+        ):
+            result = backend.launch_app(
+                bundle_id="org.mozilla.firefox",
+                additional_arguments=["-private-window", "https://technofino.in/"],
+                creates_new_application_instance=True,
+            )
+
+        assert result["pid"] == 38436
+        assert [window["window_id"] for window in result["windows"]] == [11]
+        assert backend._active_pid == 38436
+        assert backend._active_window_id == 11
 
     # ── Pointer + display introspection ─────────────────────────
 

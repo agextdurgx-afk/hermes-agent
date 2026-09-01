@@ -37,6 +37,78 @@ def test_any_explicit_hermes_bypass_maps_to_unrestricted_mode():
         assert computer_use._cua_permission_mode("session-a") == "unrestricted"
 
 
+def test_explicit_hermes_bypass_skips_the_duplicate_host_input_prompt():
+    """Headless workers must honor the same explicit bypass as the backend.
+
+    Cua still enforces any configured version-3 capability manifest as a
+    narrow-only ceiling; this test covers only Hermes' duplicate host prompt.
+    """
+    from tools.computer_use import tool as computer_use
+
+    callback = Mock(return_value="deny")
+    computer_use.set_approval_callback(callback)
+    try:
+        with patch(
+            "tools.approval.is_approval_bypass_active_for_session",
+            return_value=True,
+        ):
+            assert computer_use._request_approval(
+                "key", {"keys": "cmd+shift+p"}, "kanban-run"
+            ) is None
+    finally:
+        computer_use.set_approval_callback(None)
+
+    callback.assert_not_called()
+
+
+def test_bounded_manifest_skips_the_duplicate_host_input_prompt():
+    """The reviewed Cua manifest is the unattended action boundary."""
+    from tools.computer_use import tool as computer_use
+
+    callback = Mock(return_value="deny")
+    computer_use.set_approval_callback(callback)
+    try:
+        with patch(
+            "tools.computer_use.cua_backend._cua_configured_permission_mode",
+            return_value="bounded",
+        ), patch(
+            "tools.computer_use.cua_backend._cua_capability_manifest",
+            return_value="/reviewed/cua-capabilities.yaml",
+        ), patch(
+            "tools.approval.is_approval_bypass_active_for_session",
+            return_value=False,
+        ):
+            assert computer_use._request_approval(
+                "scroll", {"direction": "down"}, "kanban-run"
+            ) is None
+    finally:
+        computer_use.set_approval_callback(None)
+
+    callback.assert_not_called()
+
+
+def test_approval_resolution_failure_still_prompts():
+    """A broken bypass resolver must fail closed to the existing prompt."""
+    from tools.computer_use import tool as computer_use
+
+    callback = Mock(return_value="deny")
+    computer_use.set_approval_callback(callback)
+    try:
+        with patch(
+            "tools.approval.is_approval_bypass_active_for_session",
+            side_effect=RuntimeError("config unavailable"),
+        ):
+            result = computer_use._request_approval(
+                "click", {"element": 1}, "kanban-run"
+            )
+    finally:
+        computer_use.set_approval_callback(None)
+
+    assert result is not None
+    assert '"error": "denied by user"' in result
+    callback.assert_called_once()
+
+
 def test_gateway_session_key_yolo_maps_to_unrestricted_mode():
     """Gateway /yolo keys bypass off the gateway session_key contextvar,
     not the DB session_id the tool path passes. Mode resolution must consult

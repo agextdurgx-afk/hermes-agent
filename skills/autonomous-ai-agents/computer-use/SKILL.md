@@ -94,11 +94,24 @@ key               keys="<save shortcut>" | "return" | "escape" | "<modifier>+t"
 wait              seconds=0.5
 list_apps
 focus_app         app="<app name>"   raise_window=false   (default: don't raise)
+launch_app        bundle_id="…" urls=["…"] additional_arguments=["…"] creates_new_application_instance=true
+list_windows_for_pid pid=1234                 (only the exact PID returned by launch_app)
+kill_app          pid=1234                    (only the exact isolated launch PID)
 ```
 
 All actions accept optional `capture_after=True` to get a follow-up
 screenshot in the same tool call. All actions that target an element
 accept `modifiers=[…]` for held keys.
+
+For a bounded unattended browser task, prefer `launch_app` with an exact
+bundle ID and `creates_new_application_instance=true`. The reviewed capability
+manifest must authorize that one application and the `launch_app` tool. Use the
+returned `(pid, window_id)` for exact captures; do not fall back to unfiltered
+`list_apps`, `list_windows`, or desktop capture merely to discover a PID.
+If a valid new-instance launch returns a PID but no window because first-run
+startup is still in progress, wait and use `list_windows_for_pid` with that
+exact PID. Never substitute a different PID. Close the isolated process with
+`kill_app` when the bounded task ends.
 
 The input actions (`click`, `double_click`, `right_click`, `middle_click`,
 `drag`, `scroll`, `type`, `key`) also accept `delivery_mode`. The optional

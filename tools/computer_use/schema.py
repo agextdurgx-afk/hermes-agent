@@ -57,7 +57,10 @@ COMPUTER_USE_SCHEMA: Dict[str, Any] = {
                     "wait",
                     "list_apps",
                     "list_windows",
+                    "list_windows_for_pid",
                     "focus_app",
+                    "launch_app",
+                    "kill_app",
                 ],
                 "description": (
                     "Which action to perform. `capture` is free (no side "
@@ -91,11 +94,37 @@ COMPUTER_USE_SCHEMA: Dict[str, Any] = {
                     "elements."
                 ),
             },
+            "bundle_id": {
+                "type": "string",
+                "description": (
+                    "For action='launch_app', the exact application bundle ID. "
+                    "Prefer this over app/name so bounded capability manifests "
+                    "can authorize one application precisely."
+                ),
+            },
+            "urls": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "For action='launch_app', optional URLs or file targets to open.",
+            },
+            "additional_arguments": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "For action='launch_app', optional argv passed to the application.",
+            },
+            "creates_new_application_instance": {
+                "type": "boolean",
+                "description": (
+                    "For action='launch_app', force a separate application "
+                    "instance and return its pid/windows. Use this for an "
+                    "isolated task window rather than adopting a running one."
+                ),
+            },
             "pid": {
                 "type": "integer",
                 "description": (
-                    "Optional exact process target for action='capture'. Pair "
-                    "with window_id when discovery cannot resolve an X11 app."
+                    "Exact process target for capture, list_windows_for_pid, "
+                    "or kill_app. Pair with window_id for an exact capture."
                 ),
             },
             "window_id": {

@@ -479,6 +479,45 @@ def _empty_discovery_reason() -> str:
     )
 
 
+def _macos_running_app_pids(bundle_id: str) -> List[int]:
+    """Return only PIDs for one exact bundle without exposing app inventory.
+
+    Firefox can redirect a nominal new-instance launch into its existing main
+    process. Bounded Cua sessions cannot call unfiltered list_apps/list_windows
+    without granting desktop-wide observation, so the trusted host resolves
+    the exact bundle's PIDs and still leaves every window read/action subject
+    to Cua's application-scoped capability manifest.
+    """
+    if sys.platform != "darwin" or not bundle_id:
+        return []
+    bundle_literal = json.dumps(bundle_id)
+    script = (
+        'ObjC.import("AppKit"); '
+        f'$.NSRunningApplication.runningApplicationsWithBundleIdentifier({bundle_literal})'
+        '.js.map(function(app){ return Number(app.processIdentifier); }).join(",")'
+    )
+    try:
+        proc = subprocess.run(
+            ["osascript", "-l", "JavaScript", "-e", script],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=5,
+            check=False,
+        )
+    except Exception:
+        return []
+    if proc.returncode != 0:
+        return []
+    pids: List[int] = []
+    for value in (proc.stdout or "").strip().split(","):
+        pid = _positive_int(value.strip())
+        if pid is not None:
+            pids.append(pid)
+    return sorted(set(pids))
+
+
 def _z_index_uninformative(windows: List[Dict[str, Any]]) -> bool:
     """True when every window shares the same z_index (common on Linux/X11)."""
     if not windows:
@@ -2764,6 +2803,10 @@ class CuaDriverBackend(ComputerUseBackend):
         # Sticky context — updated by capture(), used by action tools.
         self._active_pid: Optional[int] = None
         self._active_window_id: Optional[int] = None
+        # PID returned by a reviewed new-instance launch. It is the only PID
+        # eligible for exact window recovery and process close. Redirected or
+        # reused application processes are deliberately never killable.
+        self._isolated_launch_pid: Optional[int] = None
         self._last_app: Optional[str] = None  # last app name targeted via capture/focus_app
         # Exact identity for capture_after. App names may be generic on Linux
         # (for example, multiple unrelated Qt windows can say Qt6Application).
@@ -3185,6 +3228,28 @@ class CuaDriverBackend(ComputerUseBackend):
             pid = None
         if _is_placeholder_id(window_id):
             window_id = None
+        # launch_app()/focus_app() establish a reviewed, exact sticky target.
+        # Reuse it before any window discovery when the caller asks for the
+        # current target (no selector) or repeats its exact app name.  This is
+        # essential in bounded mode: an unfiltered list_windows request is a
+        # desktop-wide observation and must remain denied by the manifest,
+        # while get_window_state for the already-authorized pid/window pair is
+        # permitted.  Never reuse the target for a different app selector.
+        if (
+            pid is None
+            and window_id is None
+            and self._active_pid is not None
+            and self._active_window_id is not None
+            and (
+                not app
+                or (
+                    self._last_app
+                    and app.strip().casefold() == str(self._last_app).strip().casefold()
+                )
+            )
+        ):
+            pid = self._active_pid
+            window_id = self._active_window_id
         # Step 0: explicit full-screen capture — a composited grab of
         # everything displayed, via get_desktop_state. Bypasses window
         # enumeration entirely (also keeps screenshots working when Windows
@@ -3830,6 +3895,41 @@ class CuaDriverBackend(ComputerUseBackend):
     def list_windows(self) -> List[Dict[str, Any]]:
         return self._load_windows()
 
+    def list_windows_for_pid(self, pid: int) -> List[Dict[str, Any]]:
+        """Resolve windows only for the exact isolated PID returned by launch.
+
+        This is the safe recovery path when a slow first-run application has
+        started but launch_app returned before its first window became ready.
+        It never enumerates another process or the desktop.
+        """
+        exact_pid = _positive_int(pid)
+        if exact_pid is None or exact_pid != self._isolated_launch_pid:
+            raise ValueError("window discovery is limited to the exact isolated launch PID")
+        out = self._session.call_tool(
+            "list_windows",
+            {"pid": exact_pid, "on_screen_only": False, "session": self._session_id},
+        )
+        windows = [
+            window for window in _ingest_windows(_windows_from_tool_result(out))
+            if window["pid"] == exact_pid
+        ]
+        windows.sort(
+            key=lambda window: (
+                not window.get("off_screen", False),
+                bool(str(window.get("title") or "").strip()),
+                int(window.get("z_index") or 0),
+            ),
+            reverse=True,
+        )
+        if windows:
+            target = windows[0]
+            self._active_pid = exact_pid
+            self._active_window_id = target["window_id"]
+            self._snapshot_tokens = {}
+            self._last_app = target.get("app_name") or self._last_app
+            self._last_target = {"pid": exact_pid, "window_id": target["window_id"]}
+        return windows
+
     def focus_app(self, app: str, raise_window: bool = False) -> ActionResult:
         """Target an app, optionally invoking standalone foreground focus.
 
@@ -3844,6 +3944,36 @@ class CuaDriverBackend(ComputerUseBackend):
         separately approved by the Hermes adapter, and uses cua-driver's
         standalone ``bring_to_front`` tool rather than an action property.
         """
+        # If a reviewed launch/capture already pinned this exact app, selecting
+        # it again must not fall back to desktop-wide window enumeration.  The
+        # target is already an exact pid/window pair and Cua will enforce the
+        # application resource boundary again on every action.
+        if (
+            self._active_pid is not None
+            and self._active_window_id is not None
+            and self._last_app
+            and app.strip().casefold() == str(self._last_app).strip().casefold()
+        ):
+            if raise_window:
+                focused = self.bring_to_front(
+                    pid=self._active_pid,
+                    window_id=self._active_window_id,
+                )
+                if not focused.ok:
+                    return focused
+                focused.action = "focus_app"
+                focused.meta["target_selected"] = True
+                return focused
+            return ActionResult(
+                ok=True,
+                action="focus_app",
+                message=(
+                    f"Retained exact target {self._last_app} "
+                    f"(pid {self._active_pid}, window {self._active_window_id}) "
+                    "without window enumeration."
+                ),
+            )
+
         try:
             windows = self._load_windows()
         except Exception:
@@ -3927,13 +4057,130 @@ class CuaDriverBackend(ComputerUseBackend):
             args["additional_arguments"] = list(additional_arguments)
         if creates_new_application_instance:
             args["creates_new_application_instance"] = True
+        # Snapshot only this exact application's windows before launch. This
+        # handles single-instance apps (notably Firefox), which may redirect a
+        # new private window to an existing process and let the helper PID
+        # exit. Old window titles/content are never returned to the model; Cua
+        # still verifies every pid against the bounded application manifest.
+        prior_window_ids: Dict[int, set[int]] = {}
+        if bundle_id and sys.platform == "darwin":
+            for running_pid in _macos_running_app_pids(bundle_id):
+                try:
+                    prior = self._session.call_tool(
+                        "list_windows",
+                        {"pid": running_pid, "on_screen_only": False, "session": self._session_id},
+                    )
+                    prior_window_ids[running_pid] = {
+                        int(window.get("window_id"))
+                        for window in _windows_from_tool_result(prior)
+                        if _positive_int(window.get("window_id")) is not None
+                    }
+                except Exception:
+                    prior_window_ids[running_pid] = set()
+
         out = self._session.call_tool("launch_app", args)
-        return out["structuredContent"] or {"data": out["data"]}
+        result = out["structuredContent"] or {"data": out["data"]}
+        if (
+            isinstance(result, dict)
+            and not result.get("windows")
+            and bundle_id
+            and sys.platform == "darwin"
+        ):
+            deadline = time.monotonic() + 10.0
+            private_targets: List[Tuple[int, Dict[str, Any]]] = []
+            requested_private_window = any(
+                value == "-private-window" for value in (additional_arguments or [])
+            )
+            while time.monotonic() < deadline:
+                new_targets: List[Tuple[int, Dict[str, Any]]] = []
+                private_targets = []
+                for running_pid in _macos_running_app_pids(bundle_id):
+                    try:
+                        current = self._session.call_tool(
+                            "list_windows",
+                            {"pid": running_pid, "on_screen_only": False, "session": self._session_id},
+                        )
+                    except Exception:
+                        continue
+                    for window in _windows_from_tool_result(current):
+                        window_id = _positive_int(window.get("window_id"))
+                        title = str(window.get("title") or "").strip()
+                        if (
+                            requested_private_window
+                            and window_id is not None
+                            and bool(window.get("is_on_screen"))
+                            and title.endswith("Private Browsing")
+                        ):
+                            private_targets.append((running_pid, window))
+                        if window_id is None or window_id in prior_window_ids.get(running_pid, set()):
+                            continue
+                        new_targets.append((running_pid, window))
+                if new_targets:
+                    new_targets.sort(
+                        key=lambda item: (
+                            bool(item[1].get("is_on_screen")),
+                            bool(str(item[1].get("title") or "").strip()),
+                            int(item[1].get("z_index") or 0),
+                        ),
+                        reverse=True,
+                    )
+                    redirected_pid, redirected_window = new_targets[0]
+                    result["pid"] = redirected_pid
+                    result["windows"] = [redirected_window]
+                    result["redirected_to_existing_process"] = True
+                    break
+                time.sleep(0.5)
+            # Firefox may reuse an already-open Private Browsing window and
+            # add a new tab instead of creating a new window. Return only that
+            # exact private window (never the other Firefox windows/titles) so
+            # the model remains pinned to private state without needing
+            # unfiltered desktop discovery.
+            if not result.get("windows") and private_targets:
+                private_targets.sort(
+                    key=lambda item: int(item[1].get("z_index") or 0),
+                    reverse=True,
+                )
+                redirected_pid, redirected_window = private_targets[0]
+                result["pid"] = redirected_pid
+                result["windows"] = [redirected_window]
+                result["redirected_to_existing_process"] = True
+                result["reused_private_window"] = True
+        if isinstance(result, dict):
+            pid = _positive_int(result.get("pid"))
+            self._isolated_launch_pid = (
+                pid
+                if creates_new_application_instance
+                and pid is not None
+                and result.get("redirected_to_existing_process") is not True
+                and result.get("reused_private_window") is not True
+                else None
+            )
+            windows = _ingest_windows(result.get("windows") or [])
+            windows.sort(key=lambda window: window["z_index"], reverse=True)
+            target = windows[0] if windows else None
+            if pid is not None and target is not None:
+                self._active_pid = pid
+                self._active_window_id = target["window_id"]
+                self._snapshot_tokens = {}
+                self._last_app = target.get("app_name") or result.get("name") or name or bundle_id
+                self._last_target = {
+                    "pid": self._active_pid,
+                    "window_id": self._active_window_id,
+                }
+        return result
 
     def kill_app(self, *, pid: int) -> ActionResult:
         """Terminate by pid. Equivalent to ``kill -9`` on POSIX,
         ``taskkill /F`` on Windows."""
-        return self._action("kill_app", {"pid": int(pid)})
+        exact_pid = _positive_int(pid)
+        if exact_pid is None or exact_pid != self._isolated_launch_pid:
+            raise ValueError("kill_app is limited to the exact isolated launch PID")
+        result = self._action("kill_app", {"pid": exact_pid})
+        if result.ok:
+            self._isolated_launch_pid = None
+            if self._active_pid == exact_pid:
+                self._clear_active_target()
+        return result
 
     def bring_to_front(self, *, pid: int,
                        window_id: Optional[int] = None) -> ActionResult:
