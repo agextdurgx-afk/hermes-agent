@@ -640,6 +640,54 @@ def test_multiplex_ticker_ticks_each_profile_once(tmp_path, monkeypatch):
         f"Expected >= {len(profile_homes)} tick calls, got {len(tick_count)}"
 
 
+def test_multiplex_ticker_has_one_owner_and_fails_over(tmp_path):
+    """Concurrent desktop/gateway tickers elect one owner, then fail over."""
+    from cron.scheduler_provider import InProcessCronScheduler
+
+    profile_home = tmp_path / "default"
+    (profile_home / "cron").mkdir(parents=True)
+    profile_homes = [("default", profile_home)]
+    ticking_threads: set[int] = set()
+    first_stop = threading.Event()
+    second_stop = threading.Event()
+
+    def _tracking_tick(*args, **kwargs):
+        ticking_threads.add(threading.get_ident())
+        return 0
+
+    first = InProcessCronScheduler()
+    second = InProcessCronScheduler()
+    with patch("cron.scheduler.tick", side_effect=_tracking_tick), \
+         patch("cron.jobs.record_ticker_heartbeat", lambda **kw: None):
+        first_thread = threading.Thread(
+            target=first.start,
+            args=(first_stop,),
+            kwargs={"interval": 0.01, "profile_homes": profile_homes},
+            daemon=True,
+        )
+        second_thread = threading.Thread(
+            target=second.start,
+            args=(second_stop,),
+            kwargs={"interval": 0.01, "profile_homes": profile_homes},
+            daemon=True,
+        )
+        first_thread.start()
+        assert _wait_until(lambda: len(ticking_threads) == 1)
+        second_thread.start()
+        time.sleep(0.1)
+        assert len(ticking_threads) == 1
+
+        first_stop.set()
+        first_thread.join(timeout=5)
+        assert not first_thread.is_alive()
+        assert _wait_until(lambda: len(ticking_threads) == 2)
+
+        second_stop.set()
+        second_thread.join(timeout=5)
+
+    assert not second_thread.is_alive()
+
+
 def test_multiplex_ticker_skips_deleted_profile_from_startup_snapshot(tmp_path):
     """A stale profile_homes entry must not recreate a deleted profile."""
     import cron.jobs as jobs

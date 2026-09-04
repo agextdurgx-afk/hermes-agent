@@ -20,10 +20,20 @@ selected via the `cron.provider` config key (empty = built-in).
 from __future__ import annotations
 
 import inspect
+import os
 import threading
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - non-Unix
+    fcntl = None
+try:
+    import msvcrt
+except ImportError:  # pragma: no cover - non-Windows
+    msvcrt = None
 
 # Cap for the exponential tick backoff applied while consecutive ticks fail
 # with fd exhaustion (EMFILE/ENFILE, #87644).  Base is the tick interval
@@ -88,6 +98,63 @@ def _existing_profile_homes(profile_homes: list) -> list:
         if Path(home).is_dir():
             live.append(entry)
     return live
+
+
+def _multiplex_owner_lock_path(profile_homes: list) -> Path:
+    """Return one stable lock path shared by every multiplex ticker.
+
+    Desktop profile backends and a multiplex gateway enumerate the same set of
+    profile homes but run in separate processes. A per-profile tick lock only
+    serializes an individual tick; it does not elect one long-lived scheduler,
+    so staggered backends can all observe the same due occurrence before its
+    fire claim is persisted. Anchor the owner lease at the common profile root
+    so exactly one process owns the multiplex loop while the others wait and
+    can take over after that process exits.
+    """
+    homes = [
+        Path(entry[1] if isinstance(entry, tuple) else entry).resolve()
+        for entry in profile_homes
+    ]
+    if not homes:
+        raise ValueError("profile_homes must not be empty")
+    common_root = Path(os.path.commonpath([str(home) for home in homes]))
+    return common_root / ".cron-multiplex-owner.lock"
+
+
+def _try_acquire_multiplex_owner(profile_homes: list):
+    """Acquire the cross-process multiplex-owner lease without blocking."""
+    lock_path = _multiplex_owner_lock_path(profile_homes)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = open(lock_path, "a+b")
+    try:
+        if fcntl is not None:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        elif msvcrt is not None:  # pragma: no cover - Windows
+            handle.seek(0, os.SEEK_END)
+            if handle.tell() == 0:
+                handle.write(b"\0")
+                handle.flush()
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:  # pragma: no cover - rare unsupported platform
+            return handle
+        return handle
+    except (BlockingIOError, OSError):
+        handle.close()
+        return None
+
+
+def _release_multiplex_owner(handle) -> None:
+    if handle is None:
+        return
+    try:
+        if fcntl is not None:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        elif msvcrt is not None:  # pragma: no cover - Windows
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+    finally:
+        handle.close()
 
 
 class CronScheduler(ABC):
@@ -681,6 +748,65 @@ class InProcessCronScheduler(CronScheduler):
             len(profile_homes),
             [p[0] if isinstance(p, tuple) else p for p in profile_homes],
         )
+
+        # One desktop backend is spawned per opened profile, and a real
+        # multiplex gateway may be running at the same time. The per-store
+        # tick lock prevents simultaneous file mutation but does not provide a
+        # durable scheduler owner between ticks. Elect one owner for the whole
+        # multiplex loop; followers wait and automatically take over if the
+        # owner exits.
+        owner_handle = None
+        retry_seconds = max(0.05, min(float(interval or 1), 5.0))
+        while not stop_event.is_set() and owner_handle is None:
+            owner_handle = _try_acquire_multiplex_owner(profile_homes)
+            if owner_handle is None:
+                stop_event.wait(retry_seconds)
+        if owner_handle is None:
+            return
+        logger.info(
+            "Acquired multiplex cron owner lease at %s",
+            _multiplex_owner_lock_path(profile_homes),
+        )
+
+        try:
+            self._run_multiplex_owner_loop(
+                stop_event,
+                profile_homes=profile_homes,
+                adapters=adapters,
+                loop=loop,
+                interval=interval,
+                can_dispatch=can_dispatch,
+                cron_tick=cron_tick,
+                clear_ticker_error=clear_ticker_error,
+                record_ticker_error=record_ticker_error,
+                record_ticker_heartbeat=record_ticker_heartbeat,
+                use_cron_store=use_cron_store,
+                set_hermes_home_override=set_hermes_home_override,
+                reset_hermes_home_override=reset_hermes_home_override,
+                logger=logger,
+            )
+        finally:
+            _release_multiplex_owner(owner_handle)
+
+    def _run_multiplex_owner_loop(
+        self,
+        stop_event,
+        *,
+        profile_homes,
+        adapters,
+        loop,
+        interval,
+        can_dispatch,
+        cron_tick,
+        clear_ticker_error,
+        record_ticker_error,
+        record_ticker_heartbeat,
+        use_cron_store,
+        set_hermes_home_override,
+        reset_hermes_home_override,
+        logger,
+    ):
+        """Run recovery and ticks after this process owns the multiplex lease."""
 
         # Recovery + initial heartbeat for every profile.
         # A profile may have been deleted since this snapshot was taken;
