@@ -47,7 +47,6 @@ _FAILURE_TYPE_ORDER = (
     ("agent", ("agent", "model", "provider", "inference")),
 )
 MAX_ERROR_CHARS = 500
-_MAX_SIGNATURE_ERROR_CHARS = 200
 
 _lock = threading.RLock()
 
@@ -135,8 +134,8 @@ def _normalize_error(error: str) -> str:
     return re.sub(r"\s+", " ", str(error or "")).strip().lower()
 
 
-def _redact_error(error: str) -> str:
-    """Redact secrets then bound the stored error length."""
+def _redact_error_full(error: str) -> str:
+    """Redact secrets without collapsing the later failure cause."""
     text = str(error or "")
     try:
         from agent.redact import redact_sensitive_text
@@ -145,12 +144,23 @@ def _redact_error(error: str) -> str:
     except Exception:
         # Redaction is best-effort; the scheduler path never fails on it.
         pass
-    return text[:MAX_ERROR_CHARS]
+    return text
+
+
+def _redact_error(error: str) -> str:
+    """Return the bounded terminal-display copy of one redacted error."""
+    return _redact_error_full(error)[:MAX_ERROR_CHARS]
 
 
 def _error_signature(job_id: str, error: str) -> str:
-    """Dedup key: stable for same job + same normalized error prefix."""
-    normalized = _normalize_error(error)[:_MAX_SIGNATURE_ERROR_CHARS]
+    """Dedup key: stable for the complete normalized failure cause.
+
+    The display copy is deliberately bounded, but the signature must not be.
+    Prefix-only signing can collapse failures whose useful cause appears after
+    a runner's common structured envelope, so acknowledging one transient
+    refusal may accidentally suppress a later integrity failure.
+    """
+    normalized = _normalize_error(_redact_error_full(error))
     digest = hashlib.sha256(job_id.encode() + normalized.encode()).hexdigest()
     return digest[:12]
 

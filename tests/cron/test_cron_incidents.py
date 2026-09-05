@@ -117,6 +117,36 @@ def test_error_change_mints_new_incident(monkeypatch, tmp_path):
     assert inc.count_incidents() == 2
 
 
+def test_errors_with_same_long_prefix_keep_distinct_incidents(monkeypatch, tmp_path):
+    inc = _point_db(monkeypatch, tmp_path)
+    common = "structured runner envelope " + ("x" * 800)
+
+    contention_id, contention_new = inc.upsert_incident(
+        "job-1", f"{common} maintenance admission is busy with live process 42"
+    )
+    integrity_id, integrity_new = inc.upsert_incident(
+        "job-1", f"{common} structural health found an integrity failure"
+    )
+
+    assert contention_new is True
+    assert integrity_new is True
+    assert contention_id != integrity_id
+    assert inc.count_incidents() == 2
+
+
+def test_complete_long_error_still_dedups_after_display_truncation(monkeypatch, tmp_path):
+    inc = _point_db(monkeypatch, tmp_path)
+    error = "same structured envelope " + ("x" * 600) + " exact terminal cause"
+
+    first_id, first_new = inc.upsert_incident("job-1", error)
+    second_id, second_new = inc.upsert_incident("job-1", error.upper())
+
+    assert first_new is True
+    assert second_new is False
+    assert first_id == second_id
+    assert len(inc.get_incident(first_id)["error"]) <= incidents.MAX_ERROR_CHARS
+
+
 # ── Redaction / classification ─────────────────────────────────────────────
 
 
