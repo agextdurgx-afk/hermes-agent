@@ -84,6 +84,27 @@ def test_artifact_build_allows_explicit_nix_package_build_marker(kind, artifact_
     if kind == "wheel":
         with zipfile.ZipFile(artifacts[0]) as wheel:
             shipped = set(wheel.namelist())
+        state_modules = {
+            path.name
+            for path in PROJECT_ROOT.glob("hermes_state*.py")
+        }
+        assert state_modules <= shipped
+        env = os.environ.copy()
+        env.pop("PYTHONPATH", None)
+        imported = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                "-c",
+                f"import sys; sys.path.insert(0, {str(artifacts[0])!r}); import hermes_state_registry",
+            ],
+            cwd=tmp_path,
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert imported.returncode == 0, imported.stderr
     else:
         with tarfile.open(artifacts[0]) as sdist:
             shipped = {

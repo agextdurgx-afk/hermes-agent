@@ -1127,7 +1127,7 @@ def test_real_child_cannot_reach_main_module_after_parent_eof(kanban_home, tmp_p
         assert kb.reclaim_task(conn, worker, reason="child EOF cleanup")
 
 
-def test_real_child_reaches_main_only_after_pid_bound_authorization(
+def test_installed_child_outside_checkout_reaches_main_only_after_pid_bound_authorization(
     kanban_home, tmp_path,
 ):
     sentinel = tmp_path / "startup-authorized"
@@ -1145,6 +1145,7 @@ def test_real_child_reaches_main_only_after_pid_bound_authorization(
             "HERMES_KANBAN_RUN_ID": str(claimed.current_run_id),
             "HERMES_KANBAN_CLAIM_LOCK": claimed.claim_lock,
         })
+        env.pop("PYTHONPATH", None)
         assert claimed.execution_launch_nonce not in json.dumps(env)
         code = (
             "import json, os; import hermes_cli.main; "
@@ -1152,11 +1153,12 @@ def test_real_child_reaches_main_only_after_pid_bound_authorization(
             f"open({str(env_dump)!r}, 'w', encoding='utf-8').write(json.dumps(dict(os.environ)))"
         )
         proc = subprocess.Popen(
-            [sys.executable, "-c", code],
+            [sys.executable, "-I", "-c", code],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             env=env,
+            cwd=tmp_path,
         )
         with kb._execution_launch_fence(conn):
             kb._mark_execution_launch_spawning(
