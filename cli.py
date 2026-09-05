@@ -29,7 +29,7 @@ except ModuleNotFoundError:
 # from downgrading admitted work to the legacy path.
 from hermes_cli.kanban_launch import require_execution_launch as _require_execution_launch
 
-_require_execution_launch()
+_require_execution_launch(allow_read_only_kanban=False)
 del _require_execution_launch
 
 import logging

@@ -67,7 +67,7 @@ except ModuleNotFoundError:
 # marker cannot turn governed work into an ordinary unguarded worker.
 from hermes_cli.kanban_launch import require_execution_launch as _require_execution_launch
 
-_require_execution_launch()
+_require_execution_launch(allow_read_only_kanban=True)
 del _require_execution_launch
 
 # Windows: neutralize CPython's ``platform._syscmd_ver`` before anything else

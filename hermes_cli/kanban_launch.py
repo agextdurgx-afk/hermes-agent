@@ -169,8 +169,16 @@ def _missing_capability_reason(task_id: str, db_path: Path) -> Optional[str]:
     return None
 
 
-def require_execution_launch() -> Optional[dict[str, Any]]:
-    """Consume the startup capability before any agent/plugin/tool startup."""
+def require_execution_launch(
+    *, allow_read_only_kanban: bool = False,
+) -> Optional[dict[str, Any]]:
+    """Consume the startup capability before any agent/plugin/tool startup.
+
+    The inspection exception is an explicit property of the modern
+    ``hermes_cli.main`` entrypoint, whose parser owns the exact ``kanban show``
+    grammar.  Legacy ``cli.py`` is Fire-driven and interprets those same words
+    as agent input, so it must always leave this flag false.
+    """
     global _CONSUMED
     if _CONSUMED is not None:
         return dict(_CONSUMED)
@@ -179,7 +187,7 @@ def require_execution_launch() -> Optional[dict[str, Any]]:
         task_id = str(os.environ.get("HERMES_KANBAN_TASK") or "").strip()
         if not task_id:
             return None
-        if _is_read_only_kanban_cli(sys.argv[1:]):
+        if allow_read_only_kanban and _is_read_only_kanban_cli(sys.argv[1:]):
             return None
         db_raw = str(os.environ.get("HERMES_KANBAN_DB") or "").strip()
         if not db_raw:
