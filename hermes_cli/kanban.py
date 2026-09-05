@@ -1040,6 +1040,66 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Emit one JSON object per task on stdout",
     )
 
+    # --- execution admission ---
+    p_admission = sub.add_parser(
+        "admission",
+        help="Manage a board-scoped fail-closed execution allowlist",
+    )
+    admission_sub = p_admission.add_subparsers(
+        dest="admission_action", metavar="ACTION",
+    )
+    p_admission_begin = admission_sub.add_parser(
+        "begin", help="Install a deny-all construction barrier",
+    )
+    p_admission_begin.add_argument("authorization_id")
+    p_admission_begin.add_argument("--generation", type=int, required=True)
+    p_admission_begin.add_argument("--evidence-sha256", required=True)
+    p_admission_begin.add_argument("--json", action="store_true")
+
+    p_admission_bind = admission_sub.add_parser(
+        "bind", help="Freeze exact parked task identities under the barrier",
+    )
+    p_admission_bind.add_argument("authorization_id")
+    p_admission_bind.add_argument("--generation", type=int, required=True)
+    p_admission_bind.add_argument("--evidence-sha256", required=True)
+    p_admission_bind.add_argument(
+        "--tasks-file",
+        required=True,
+        help="JSON array, or object with a tasks array, of exact task bindings",
+    )
+    p_admission_bind.add_argument("--json", action="store_true")
+
+    p_admission_activate = admission_sub.add_parser(
+        "activate", help="Activate the exact identity-bound worker allowlist",
+    )
+    p_admission_activate.add_argument("authorization_id")
+    p_admission_activate.add_argument("--generation", type=int, required=True)
+    p_admission_activate.add_argument("--policy-sha256", required=True)
+    p_admission_activate.add_argument("--json", action="store_true")
+
+    p_admission_seal = admission_sub.add_parser(
+        "seal", help="Return an active admission to deny-all terminal state",
+    )
+    p_admission_seal.add_argument("authorization_id")
+    p_admission_seal.add_argument("--generation", type=int, required=True)
+    p_admission_seal.add_argument("--policy-sha256", required=True)
+    p_admission_seal.add_argument("--reason", required=True)
+    p_admission_seal.add_argument("--json", action="store_true")
+
+    p_admission_close = admission_sub.add_parser(
+        "close", help="Release an exact sealed admission and retain its tombstone",
+    )
+    p_admission_close.add_argument("authorization_id")
+    p_admission_close.add_argument("--generation", type=int, required=True)
+    p_admission_close.add_argument("--policy-sha256", required=True)
+    p_admission_close.add_argument("--json", action="store_true")
+
+    p_admission_show = admission_sub.add_parser(
+        "show", help="Show the live admission or one historical authorization",
+    )
+    p_admission_show.add_argument("authorization_id", nargs="?", default=None)
+    p_admission_show.add_argument("--json", action="store_true")
+
     # --- gc ---
     p_gc = sub.add_parser(
         "gc", help="Garbage-collect archived-task workspaces, old events, and old logs",
@@ -1214,6 +1274,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "context":  _cmd_context,
             "specify":  _cmd_specify,
             "decompose":  _cmd_decompose,
+            "admission": _cmd_admission,
             "gc":       _cmd_gc,
         }
         handler = handlers.get(action)
@@ -1244,6 +1305,123 @@ def _profile_author() -> str:
         return "user"
 
 
+def _cmd_admission(args: argparse.Namespace) -> int:
+    """Manage the board's singleton execution-admission barrier."""
+    action = getattr(args, "admission_action", None)
+    if not action:
+        print(
+            "usage: hermes kanban admission "
+            "{begin,bind,activate,seal,close,show} ...",
+            file=sys.stderr,
+        )
+        return 2
+
+    if action != "show":
+        configured = _configured_kanban_orchestrator_profile()
+        actor = _profile_author()
+        if not configured:
+            print(
+                "kanban: execution-admission mutation requires an explicit "
+                "kanban.orchestrator_profile",
+                file=sys.stderr,
+            )
+            return 1
+        if actor != configured:
+            print(
+                "kanban: execution-admission mutation refused; only configured "
+                f"orchestrator profile {configured!r} may perform it "
+                f"(current profile: {actor!r})",
+                file=sys.stderr,
+            )
+            return 1
+
+    with kb.connect_closing() as conn:
+        if action == "show":
+            status = kb.execution_admission_status(
+                conn, getattr(args, "authorization_id", None)
+            )
+            if status is None:
+                if getattr(args, "json", False):
+                    print("null")
+                else:
+                    print("(no matching execution admission)")
+                return 0
+        elif action == "begin":
+            status = kb.begin_execution_admission(
+                conn,
+                authorization_id=args.authorization_id,
+                generation=args.generation,
+                evidence_sha256=args.evidence_sha256,
+            )
+        elif action == "bind":
+            path = Path(args.tasks_file).expanduser()
+            try:
+                raw = path.read_bytes()
+            except OSError as exc:
+                print(f"kanban: cannot read tasks file {path}: {exc}", file=sys.stderr)
+                return 1
+            if len(raw) > 1_000_000:
+                print("kanban: tasks file exceeds 1 MB", file=sys.stderr)
+                return 1
+            try:
+                document = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                print(f"kanban: invalid tasks JSON: {exc}", file=sys.stderr)
+                return 1
+            task_bindings = (
+                document.get("tasks") if isinstance(document, dict) else document
+            )
+            if not isinstance(task_bindings, list):
+                print(
+                    "kanban: tasks file must be a JSON array or an object with a tasks array",
+                    file=sys.stderr,
+                )
+                return 1
+            status = kb.bind_execution_admission(
+                conn,
+                authorization_id=args.authorization_id,
+                generation=args.generation,
+                evidence_sha256=args.evidence_sha256,
+                task_bindings=task_bindings,
+            )
+        elif action == "activate":
+            status = kb.activate_execution_admission(
+                conn,
+                authorization_id=args.authorization_id,
+                generation=args.generation,
+                policy_sha256=args.policy_sha256,
+            )
+        elif action == "seal":
+            status = kb.seal_execution_admission(
+                conn,
+                authorization_id=args.authorization_id,
+                generation=args.generation,
+                policy_sha256=args.policy_sha256,
+                reason=args.reason,
+            )
+        elif action == "close":
+            status = kb.close_execution_admission(
+                conn,
+                authorization_id=args.authorization_id,
+                generation=args.generation,
+                policy_sha256=args.policy_sha256,
+            )
+        else:  # pragma: no cover - argparse constrains the subcommand
+            print(f"kanban: unknown admission action {action!r}", file=sys.stderr)
+            return 2
+
+    if getattr(args, "json", False):
+        print(json.dumps(status, indent=2, ensure_ascii=False, sort_keys=True))
+    else:
+        print(
+            f"Execution admission {status['authorization_id']}: "
+            f"state={status['state']} generation={status['generation']} "
+            f"policy={status['policy_sha256'] or '(unbound)'} "
+            f"tasks={len(status['tasks'])}"
+        )
+    return 0
+
+
 _TASK_ROUTING_ACTIONS: frozenset[str] = frozenset({
     "create",
     "swarm",
@@ -1262,6 +1440,7 @@ _TASK_ROUTING_ACTIONS: frozenset[str] = frozenset({
     "dispatch",
     "specify",
     "decompose",
+    "admission",
 })
 
 
@@ -1311,6 +1490,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "notify-unsubscribe",
     "specify",
     "decompose",
+    "admission",
     "gc",
 })
 
@@ -2883,6 +3063,10 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 for (tid, who, current) in res.skipped_per_profile_capped
             ],
             "auto_assigned_default": res.auto_assigned_default,
+            "admission_guarded": [
+                {"task_id": tid, "reason": reason}
+                for (tid, reason) in res.admission_guarded
+            ],
         }, indent=2))
         return 0
     print(f"Reclaimed:    {res.reclaimed}")
@@ -2920,6 +3104,9 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             f"Skipped (non-spawnable assignee — terminal lane, OK): "
             f"{', '.join(res.skipped_nonspawnable)}"
         )
+    if res.admission_guarded:
+        for tid, reason in res.admission_guarded:
+            print(f"Denied by execution admission ({reason}): {tid}")
     return 0
 
 

@@ -1488,6 +1488,47 @@ CREATE TABLE IF NOT EXISTS task_runs (
     error               TEXT
 );
 
+-- Board-scoped, fail-closed execution admission. A live row in any state
+-- occupies ``live_slot = 1``. ``prepared`` and ``sealed`` deny every worker
+-- claim; ``active`` admits only identity-bound task rows from the child table.
+-- ``closed`` rows are immutable tombstones and release the singleton slot.
+CREATE TABLE IF NOT EXISTS execution_admissions (
+    authorization_id TEXT PRIMARY KEY,
+    generation       INTEGER NOT NULL,
+    evidence_sha256  TEXT NOT NULL,
+    state            TEXT NOT NULL,
+    live_slot        INTEGER,
+    policy_sha256    TEXT,
+    policy_json      TEXT,
+    created_at       INTEGER NOT NULL,
+    bound_at         INTEGER,
+    activated_at     INTEGER,
+    sealed_at        INTEGER,
+    closed_at        INTEGER,
+    terminal_reason  TEXT,
+    CHECK (state IN ('prepared', 'active', 'sealed', 'closed')),
+    CHECK (live_slot IS NULL OR live_slot = 1),
+    CHECK ((state = 'closed' AND live_slot IS NULL) OR
+           (state != 'closed' AND live_slot = 1))
+);
+
+CREATE TABLE IF NOT EXISTS execution_admission_tasks (
+    authorization_id    TEXT NOT NULL,
+    task_id             TEXT NOT NULL,
+    execution_kind      TEXT NOT NULL,
+    allowed_claim_status TEXT,
+    identity_sha256     TEXT NOT NULL,
+    identity_json       TEXT NOT NULL,
+    PRIMARY KEY (authorization_id, task_id),
+    CHECK (execution_kind IN ('worker', 'deterministic_no_agent')),
+    CHECK (allowed_claim_status IS NULL OR
+           allowed_claim_status IN ('ready', 'review')),
+    CHECK ((execution_kind = 'deterministic_no_agent' AND
+            allowed_claim_status IS NULL) OR
+           (execution_kind = 'worker' AND
+            allowed_claim_status IS NOT NULL))
+);
+
 -- Files attached to a task (PDFs, images, source documents). The blob
 -- lives on disk under ``attachments_root(board)/<task_id>/<stored_name>``;
 -- this row carries metadata + the absolute ``stored_path`` so the
@@ -1533,6 +1574,10 @@ CREATE INDEX IF NOT EXISTS idx_comments_task         ON task_comments(task_id, c
 CREATE INDEX IF NOT EXISTS idx_events_task           ON task_events(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_execution_admission_live
+    ON execution_admissions(live_slot) WHERE live_slot IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_execution_admission_task
+    ON execution_admission_tasks(task_id, authorization_id);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
 """
@@ -4664,6 +4709,711 @@ def _parents_satisfied(conn: sqlite3.Connection, task_id: str) -> bool:
     ).fetchone() is None
 
 
+_EXECUTION_ADMISSION_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_EXECUTION_ADMISSION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{7,191}$")
+
+
+class ExecutionAdmissionError(RuntimeError):
+    """Raised when a board-scoped execution admission fails closed."""
+
+
+def _execution_admission_json(value: Any) -> str:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _execution_admission_sha256(value: Any) -> str:
+    return hashlib.sha256(
+        _execution_admission_json(value).encode("utf-8")
+    ).hexdigest()
+
+
+def _validate_execution_admission_header(
+    authorization_id: str,
+    generation: int,
+    evidence_sha256: str,
+) -> tuple[str, int, str]:
+    authorization_id = str(authorization_id or "").strip()
+    if not _EXECUTION_ADMISSION_ID_RE.fullmatch(authorization_id):
+        raise ExecutionAdmissionError(
+            "authorization_id must be 8-192 safe identifier characters"
+        )
+    try:
+        generation = int(generation)
+    except (TypeError, ValueError) as exc:
+        raise ExecutionAdmissionError("generation must be a positive integer") from exc
+    if generation < 1:
+        raise ExecutionAdmissionError("generation must be a positive integer")
+    evidence_sha256 = str(evidence_sha256 or "").strip().lower()
+    if not _EXECUTION_ADMISSION_SHA256_RE.fullmatch(evidence_sha256):
+        raise ExecutionAdmissionError("evidence_sha256 must be lowercase sha256")
+    return authorization_id, generation, evidence_sha256
+
+
+def _live_execution_admission(conn: sqlite3.Connection) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM execution_admissions WHERE live_slot = 1 LIMIT 1"
+    ).fetchone()
+
+
+def execution_admission_status(
+    conn: sqlite3.Connection,
+    authorization_id: Optional[str] = None,
+) -> Optional[dict[str, Any]]:
+    """Return one admission and its immutable task bindings."""
+    if authorization_id is None:
+        row = _live_execution_admission(conn)
+    else:
+        row = conn.execute(
+            "SELECT * FROM execution_admissions WHERE authorization_id = ?",
+            (str(authorization_id),),
+        ).fetchone()
+    if row is None:
+        return None
+    tasks = conn.execute(
+        "SELECT task_id, execution_kind, allowed_claim_status, "
+        "identity_sha256, identity_json "
+        "FROM execution_admission_tasks WHERE authorization_id = ? "
+        "ORDER BY task_id",
+        (row["authorization_id"],),
+    ).fetchall()
+    return {
+        "authorization_id": row["authorization_id"],
+        "generation": int(row["generation"]),
+        "evidence_sha256": row["evidence_sha256"],
+        "state": row["state"],
+        "live": row["live_slot"] == 1,
+        "policy_sha256": row["policy_sha256"],
+        "policy": (
+            json.loads(row["policy_json"])
+            if row["policy_json"]
+            else None
+        ),
+        "created_at": row["created_at"],
+        "bound_at": row["bound_at"],
+        "activated_at": row["activated_at"],
+        "sealed_at": row["sealed_at"],
+        "closed_at": row["closed_at"],
+        "terminal_reason": row["terminal_reason"],
+        "tasks": [
+            {
+                "task_id": task["task_id"],
+                "execution_kind": task["execution_kind"],
+                "allowed_claim_status": task["allowed_claim_status"],
+                "identity_sha256": task["identity_sha256"],
+                "identity": json.loads(task["identity_json"]),
+            }
+            for task in tasks
+        ],
+    }
+
+
+def begin_execution_admission(
+    conn: sqlite3.Connection,
+    *,
+    authorization_id: str,
+    generation: int,
+    evidence_sha256: str,
+) -> dict[str, Any]:
+    """Install a singleton deny-all construction barrier for this board.
+
+    Beginning is allowed only from a board with no executable or running work.
+    The exact same authorization is idempotent; a different live authorization
+    is rejected. No task is admitted until a later bind and activate.
+    """
+    authorization_id, generation, evidence_sha256 = (
+        _validate_execution_admission_header(
+            authorization_id, generation, evidence_sha256
+        )
+    )
+    now = int(time.time())
+    with write_txn(conn):
+        existing = conn.execute(
+            "SELECT * FROM execution_admissions WHERE authorization_id = ?",
+            (authorization_id,),
+        ).fetchone()
+        if existing is not None:
+            if (
+                int(existing["generation"]) != generation
+                or existing["evidence_sha256"] != evidence_sha256
+            ):
+                raise ExecutionAdmissionError(
+                    "authorization_id already exists with different immutable evidence"
+                )
+            if existing["state"] == "closed":
+                raise ExecutionAdmissionError(
+                    "closed execution authorization cannot be reused"
+                )
+            return execution_admission_status(conn, authorization_id) or {}
+
+        live = _live_execution_admission(conn)
+        if live is not None:
+            raise ExecutionAdmissionError(
+                "another execution authorization already holds the board: "
+                f"{live['authorization_id']} ({live['state']})"
+            )
+        runnable = conn.execute(
+            "SELECT id, status FROM tasks "
+            "WHERE status IN ('ready', 'review', 'running') "
+            "ORDER BY id LIMIT 1"
+        ).fetchone()
+        if runnable is not None:
+            raise ExecutionAdmissionError(
+                "cannot begin execution admission while board has executable work: "
+                f"{runnable['id']} ({runnable['status']})"
+            )
+        conn.execute(
+            "INSERT INTO execution_admissions ("
+            "authorization_id, generation, evidence_sha256, state, live_slot, created_at"
+            ") VALUES (?, ?, ?, 'prepared', 1, ?)",
+            (authorization_id, generation, evidence_sha256, now),
+        )
+    status = execution_admission_status(conn, authorization_id)
+    if status is None:  # pragma: no cover - transaction invariant
+        raise ExecutionAdmissionError("execution admission disappeared after begin")
+    return status
+
+
+def _task_execution_identity(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> dict[str, Any]:
+    row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    if row is None:
+        raise ExecutionAdmissionError(f"task not found: {task_id}")
+    keys = set(row.keys())
+    try:
+        skills = json.loads(row["skills"]) if row["skills"] else []
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise ExecutionAdmissionError(f"task {task_id} has invalid skills JSON") from exc
+    if not isinstance(skills, list) or any(not isinstance(v, str) for v in skills):
+        raise ExecutionAdmissionError(f"task {task_id} has invalid skills JSON")
+    parents = [
+        parent["parent_id"]
+        for parent in conn.execute(
+            "SELECT parent_id FROM task_links WHERE child_id = ? ORDER BY parent_id",
+            (task_id,),
+        ).fetchall()
+    ]
+    return {
+        "id": row["id"],
+        "title": row["title"],
+        "body": row["body"],
+        "assignee": row["assignee"],
+        "priority": int(row["priority"] or 0),
+        "created_by": row["created_by"],
+        "workspace_kind": row["workspace_kind"],
+        "workspace_path": row["workspace_path"],
+        "branch_name": row["branch_name"] if "branch_name" in keys else None,
+        "project_id": row["project_id"] if "project_id" in keys else None,
+        "tenant": row["tenant"] if "tenant" in keys else None,
+        "idempotency_key": row["idempotency_key"] if "idempotency_key" in keys else None,
+        "max_runtime_seconds": row["max_runtime_seconds"] if "max_runtime_seconds" in keys else None,
+        "skills": skills,
+        "max_retries": row["max_retries"] if "max_retries" in keys else None,
+        "max_attempts": row["max_attempts"] if "max_attempts" in keys else None,
+        "model_override": row["model_override"] if "model_override" in keys else None,
+        "provider_override": row["provider_override"] if "provider_override" in keys else None,
+        "reasoning_effort": row["reasoning_effort"] if "reasoning_effort" in keys else None,
+        "goal_mode": bool(row["goal_mode"]) if "goal_mode" in keys else False,
+        "goal_max_turns": row["goal_max_turns"] if "goal_max_turns" in keys else None,
+        "workflow_template_id": row["workflow_template_id"] if "workflow_template_id" in keys else None,
+        "current_step_key": row["current_step_key"] if "current_step_key" in keys else None,
+        "parents": parents,
+    }
+
+
+def bind_execution_admission(
+    conn: sqlite3.Connection,
+    *,
+    authorization_id: str,
+    generation: int,
+    evidence_sha256: str,
+    task_bindings: Iterable[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Freeze exact task identities while the deny-all barrier remains live."""
+    authorization_id, generation, evidence_sha256 = (
+        _validate_execution_admission_header(
+            authorization_id, generation, evidence_sha256
+        )
+    )
+    normalized: list[dict[str, str | None]] = []
+    seen: set[str] = set()
+    for raw in task_bindings:
+        if not isinstance(raw, Mapping):
+            raise ExecutionAdmissionError("every task binding must be an object")
+        task_id = str(raw.get("task_id") or "").strip()
+        if not re.fullmatch(r"t_[A-Za-z0-9]+", task_id):
+            raise ExecutionAdmissionError(f"invalid task_id in admission: {task_id!r}")
+        if task_id in seen:
+            raise ExecutionAdmissionError(f"duplicate task binding: {task_id}")
+        seen.add(task_id)
+        execution_kind = str(raw.get("execution_kind") or "").strip()
+        allowed_claim_status = raw.get("allowed_claim_status")
+        if allowed_claim_status is not None:
+            allowed_claim_status = str(allowed_claim_status).strip()
+        if execution_kind == "deterministic_no_agent":
+            if allowed_claim_status not in {None, ""}:
+                raise ExecutionAdmissionError(
+                    f"deterministic task {task_id} cannot allow inference claims"
+                )
+            allowed_claim_status = None
+        elif execution_kind == "worker":
+            if allowed_claim_status not in {"ready", "review"}:
+                raise ExecutionAdmissionError(
+                    f"worker task {task_id} needs allowed_claim_status ready or review"
+                )
+        else:
+            raise ExecutionAdmissionError(
+                f"invalid execution_kind for {task_id}: {execution_kind!r}"
+            )
+        normalized.append({
+            "task_id": task_id,
+            "execution_kind": execution_kind,
+            "allowed_claim_status": allowed_claim_status,
+        })
+    if not normalized:
+        raise ExecutionAdmissionError("execution admission needs at least one task")
+    normalized.sort(key=lambda value: str(value["task_id"]))
+
+    now = int(time.time())
+    with write_txn(conn):
+        admission = conn.execute(
+            "SELECT * FROM execution_admissions "
+            "WHERE authorization_id = ? AND live_slot = 1",
+            (authorization_id,),
+        ).fetchone()
+        if admission is None:
+            raise ExecutionAdmissionError("live execution admission not found")
+        if (
+            int(admission["generation"]) != generation
+            or admission["evidence_sha256"] != evidence_sha256
+        ):
+            raise ExecutionAdmissionError("execution admission header changed")
+        if admission["state"] != "prepared":
+            raise ExecutionAdmissionError(
+                f"execution admission is {admission['state']}, not prepared"
+            )
+
+        entries: list[dict[str, Any]] = []
+        for binding in normalized:
+            task_id = str(binding["task_id"])
+            task_row = conn.execute(
+                "SELECT status, current_run_id, max_attempts FROM tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone()
+            if task_row is None:
+                raise ExecutionAdmissionError(f"task not found: {task_id}")
+            if task_row["status"] not in {"todo", "scheduled", "blocked"}:
+                raise ExecutionAdmissionError(
+                    f"task {task_id} must be parked before binding, got {task_row['status']}"
+                )
+            if task_row["current_run_id"] is not None:
+                raise ExecutionAdmissionError(
+                    f"task {task_id} has a current worker run"
+                )
+            attempts = int(conn.execute(
+                "SELECT COUNT(*) FROM task_runs WHERE task_id = ?", (task_id,)
+            ).fetchone()[0])
+            if attempts != 0:
+                raise ExecutionAdmissionError(
+                    f"task {task_id} already has {attempts} worker attempt(s)"
+                )
+            if task_row["max_attempts"] is None or int(task_row["max_attempts"]) != 1:
+                raise ExecutionAdmissionError(
+                    f"task {task_id} must have max_attempts=1"
+                )
+            identity = _task_execution_identity(conn, task_id)
+            identity_sha256 = _execution_admission_sha256(identity)
+            entries.append({
+                **binding,
+                "identity_sha256": identity_sha256,
+                "identity": identity,
+            })
+
+        foreign = conn.execute(
+            "SELECT id, status FROM tasks "
+            "WHERE status IN ('ready', 'review', 'running') "
+            "AND id NOT IN (" + ",".join("?" for _ in normalized) + ") "
+            "ORDER BY id LIMIT 1",
+            tuple(str(binding["task_id"]) for binding in normalized),
+        ).fetchone()
+        if foreign is not None:
+            raise ExecutionAdmissionError(
+                "foreign executable task appeared during admission construction: "
+                f"{foreign['id']} ({foreign['status']})"
+            )
+
+        policy = {
+            "schema_version": 1,
+            "authorization_id": authorization_id,
+            "generation": generation,
+            "evidence_sha256": evidence_sha256,
+            "tasks": entries,
+        }
+        policy_json = _execution_admission_json(policy)
+        policy_sha256 = hashlib.sha256(policy_json.encode("utf-8")).hexdigest()
+        if admission["policy_sha256"] is not None:
+            if (
+                admission["policy_sha256"] != policy_sha256
+                or admission["policy_json"] != policy_json
+            ):
+                raise ExecutionAdmissionError(
+                    "prepared execution admission is already bound differently"
+                )
+            return execution_admission_status(conn, authorization_id) or {}
+
+        for entry in entries:
+            conn.execute(
+                "INSERT INTO execution_admission_tasks ("
+                "authorization_id, task_id, execution_kind, "
+                "allowed_claim_status, identity_sha256, identity_json"
+                ") VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    authorization_id,
+                    entry["task_id"],
+                    entry["execution_kind"],
+                    entry["allowed_claim_status"],
+                    entry["identity_sha256"],
+                    _execution_admission_json(entry["identity"]),
+                ),
+            )
+        conn.execute(
+            "UPDATE execution_admissions "
+            "SET policy_sha256 = ?, policy_json = ?, bound_at = ? "
+            "WHERE authorization_id = ? AND state = 'prepared' AND live_slot = 1",
+            (policy_sha256, policy_json, now, authorization_id),
+        )
+    status = execution_admission_status(conn, authorization_id)
+    if status is None:  # pragma: no cover - transaction invariant
+        raise ExecutionAdmissionError("execution admission disappeared after bind")
+    return status
+
+
+def _assert_execution_admission_identities(
+    conn: sqlite3.Connection,
+    authorization_id: str,
+) -> list[sqlite3.Row]:
+    entries = conn.execute(
+        "SELECT * FROM execution_admission_tasks "
+        "WHERE authorization_id = ? ORDER BY task_id",
+        (authorization_id,),
+    ).fetchall()
+    if not entries:
+        raise ExecutionAdmissionError("execution admission has no task bindings")
+    for entry in entries:
+        identity = _task_execution_identity(conn, entry["task_id"])
+        identity_json = _execution_admission_json(identity)
+        identity_sha256 = hashlib.sha256(identity_json.encode("utf-8")).hexdigest()
+        if (
+            identity_sha256 != entry["identity_sha256"]
+            or identity_json != entry["identity_json"]
+        ):
+            raise ExecutionAdmissionError(
+                f"task identity changed after binding: {entry['task_id']}"
+            )
+    return entries
+
+
+def _execution_admission_policy_error(
+    conn: sqlite3.Connection,
+    admission: sqlite3.Row,
+) -> Optional[str]:
+    raw = admission["policy_json"]
+    digest = admission["policy_sha256"]
+    if not raw or not digest:
+        return "execution_admission_missing_policy"
+    try:
+        policy = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return "execution_admission_invalid_policy_json"
+    if _execution_admission_json(policy) != raw:
+        return "execution_admission_noncanonical_policy"
+    if hashlib.sha256(raw.encode("utf-8")).hexdigest() != digest:
+        return "execution_admission_policy_hash_mismatch"
+    if not isinstance(policy, dict) or policy.get("schema_version") != 1:
+        return "execution_admission_invalid_policy_schema"
+    if (
+        policy.get("authorization_id") != admission["authorization_id"]
+        or policy.get("generation") != int(admission["generation"])
+        or policy.get("evidence_sha256") != admission["evidence_sha256"]
+    ):
+        return "execution_admission_policy_header_mismatch"
+    policy_tasks = policy.get("tasks")
+    if not isinstance(policy_tasks, list) or not policy_tasks:
+        return "execution_admission_invalid_policy_tasks"
+    table_tasks = conn.execute(
+        "SELECT task_id, execution_kind, allowed_claim_status, "
+        "identity_sha256, identity_json "
+        "FROM execution_admission_tasks WHERE authorization_id = ? "
+        "ORDER BY task_id",
+        (admission["authorization_id"],),
+    ).fetchall()
+    expected: list[dict[str, Any]] = []
+    for entry in table_tasks:
+        try:
+            identity = json.loads(entry["identity_json"])
+        except (json.JSONDecodeError, TypeError):
+            return "execution_admission_invalid_identity_json"
+        expected.append({
+            "task_id": entry["task_id"],
+            "execution_kind": entry["execution_kind"],
+            "allowed_claim_status": entry["allowed_claim_status"],
+            "identity_sha256": entry["identity_sha256"],
+            "identity": identity,
+        })
+    if policy_tasks != expected:
+        return "execution_admission_policy_task_mismatch"
+    return None
+
+
+def activate_execution_admission(
+    conn: sqlite3.Connection,
+    *,
+    authorization_id: str,
+    generation: int,
+    policy_sha256: str,
+) -> dict[str, Any]:
+    """Activate an exact bound allowlist after revalidating the whole board."""
+    authorization_id = str(authorization_id or "").strip()
+    try:
+        generation = int(generation)
+    except (TypeError, ValueError) as exc:
+        raise ExecutionAdmissionError("generation must be a positive integer") from exc
+    policy_sha256 = str(policy_sha256 or "").strip().lower()
+    if not _EXECUTION_ADMISSION_SHA256_RE.fullmatch(policy_sha256):
+        raise ExecutionAdmissionError("policy_sha256 must be lowercase sha256")
+    now = int(time.time())
+    with write_txn(conn):
+        admission = conn.execute(
+            "SELECT * FROM execution_admissions "
+            "WHERE authorization_id = ? AND live_slot = 1",
+            (authorization_id,),
+        ).fetchone()
+        if admission is None:
+            raise ExecutionAdmissionError("live execution admission not found")
+        if int(admission["generation"]) != generation:
+            raise ExecutionAdmissionError("execution admission generation changed")
+        if admission["policy_sha256"] != policy_sha256:
+            raise ExecutionAdmissionError("execution admission policy hash changed")
+        policy_error = _execution_admission_policy_error(conn, admission)
+        if policy_error is not None:
+            raise ExecutionAdmissionError(policy_error)
+        if admission["state"] == "active":
+            _assert_execution_admission_identities(conn, authorization_id)
+            return execution_admission_status(conn, authorization_id) or {}
+        if admission["state"] != "prepared":
+            raise ExecutionAdmissionError(
+                f"execution admission is {admission['state']}, not prepared"
+            )
+        entries = _assert_execution_admission_identities(conn, authorization_id)
+        task_ids = [entry["task_id"] for entry in entries]
+        placeholders = ",".join("?" for _ in task_ids)
+        nonparked = conn.execute(
+            "SELECT id, status FROM tasks WHERE id IN (" + placeholders + ") "
+            "AND status NOT IN ('todo', 'scheduled', 'blocked') "
+            "ORDER BY id LIMIT 1",
+            tuple(task_ids),
+        ).fetchone()
+        if nonparked is not None:
+            raise ExecutionAdmissionError(
+                f"bound task is executable before activation: "
+                f"{nonparked['id']} ({nonparked['status']})"
+            )
+        foreign = conn.execute(
+            "SELECT id, status FROM tasks "
+            "WHERE status IN ('ready', 'review', 'running') "
+            "AND id NOT IN (" + placeholders + ") ORDER BY id LIMIT 1",
+            tuple(task_ids),
+        ).fetchone()
+        if foreign is not None:
+            raise ExecutionAdmissionError(
+                "foreign executable task present at activation: "
+                f"{foreign['id']} ({foreign['status']})"
+            )
+        conn.execute(
+            "UPDATE execution_admissions SET state = 'active', activated_at = ? "
+            "WHERE authorization_id = ? AND state = 'prepared' AND live_slot = 1",
+            (now, authorization_id),
+        )
+    status = execution_admission_status(conn, authorization_id)
+    if status is None:  # pragma: no cover - transaction invariant
+        raise ExecutionAdmissionError("execution admission disappeared after activate")
+    return status
+
+
+def seal_execution_admission(
+    conn: sqlite3.Connection,
+    *,
+    authorization_id: str,
+    generation: int,
+    policy_sha256: str,
+    reason: str,
+) -> dict[str, Any]:
+    """Return a live admission to deny-all while retaining a tombstone path."""
+    reason = str(reason or "").strip()
+    if len(reason) < 4 or len(reason) > 2000:
+        raise ExecutionAdmissionError("seal reason must be 4-2000 characters")
+    policy_sha256 = str(policy_sha256 or "").strip().lower()
+    now = int(time.time())
+    with write_txn(conn):
+        admission = conn.execute(
+            "SELECT * FROM execution_admissions "
+            "WHERE authorization_id = ? AND live_slot = 1",
+            (str(authorization_id),),
+        ).fetchone()
+        if admission is None:
+            raise ExecutionAdmissionError("live execution admission not found")
+        if (
+            int(admission["generation"]) != int(generation)
+            or admission["policy_sha256"] != policy_sha256
+        ):
+            raise ExecutionAdmissionError("execution admission CAS mismatch")
+        if admission["state"] == "sealed":
+            if admission["terminal_reason"] != reason:
+                raise ExecutionAdmissionError(
+                    "sealed execution admission has a different terminal reason"
+                )
+            return execution_admission_status(conn, authorization_id) or {}
+        if admission["state"] not in {"prepared", "active"}:
+            raise ExecutionAdmissionError(
+                f"execution admission is {admission['state']}, cannot seal"
+            )
+        running = conn.execute(
+            "SELECT id FROM tasks WHERE status = 'running' ORDER BY id LIMIT 1"
+        ).fetchone()
+        if running is not None:
+            raise ExecutionAdmissionError(
+                f"cannot seal while task is running: {running['id']}"
+            )
+        conn.execute(
+            "UPDATE execution_admissions "
+            "SET state = 'sealed', sealed_at = ?, terminal_reason = ? "
+            "WHERE authorization_id = ? AND live_slot = 1",
+            (now, reason, authorization_id),
+        )
+    return execution_admission_status(conn, authorization_id) or {}
+
+
+def close_execution_admission(
+    conn: sqlite3.Connection,
+    *,
+    authorization_id: str,
+    generation: int,
+    policy_sha256: str,
+) -> dict[str, Any]:
+    """Release a sealed board barrier while preserving its durable history."""
+    policy_sha256 = str(policy_sha256 or "").strip().lower()
+    now = int(time.time())
+    with write_txn(conn):
+        admission = conn.execute(
+            "SELECT * FROM execution_admissions WHERE authorization_id = ?",
+            (str(authorization_id),),
+        ).fetchone()
+        if admission is None:
+            raise ExecutionAdmissionError("execution admission not found")
+        if (
+            int(admission["generation"]) != int(generation)
+            or admission["policy_sha256"] != policy_sha256
+        ):
+            raise ExecutionAdmissionError("execution admission CAS mismatch")
+        if admission["state"] == "closed":
+            return execution_admission_status(conn, authorization_id) or {}
+        if admission["state"] != "sealed":
+            raise ExecutionAdmissionError(
+                f"execution admission is {admission['state']}, not sealed"
+            )
+        conn.execute(
+            "UPDATE execution_admissions "
+            "SET state = 'closed', live_slot = NULL, closed_at = ? "
+            "WHERE authorization_id = ? AND state = 'sealed' AND live_slot = 1",
+            (now, authorization_id),
+        )
+    return execution_admission_status(conn, authorization_id) or {}
+
+
+def execution_admission_decision(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    source_status: str,
+) -> tuple[bool, Optional[str], Optional[dict[str, Any]]]:
+    """Return whether one exact inference claim is admitted on this board."""
+    admission = _live_execution_admission(conn)
+    if admission is None:
+        return True, None, None
+    context = {
+        "authorization_id": admission["authorization_id"],
+        "generation": int(admission["generation"]),
+        "policy_sha256": admission["policy_sha256"],
+        "state": admission["state"],
+    }
+    if admission["state"] != "active":
+        return False, f"execution_admission_{admission['state']}_deny_all", context
+    policy_error = _execution_admission_policy_error(conn, admission)
+    if policy_error is not None:
+        return False, policy_error, context
+    entry = conn.execute(
+        "SELECT * FROM execution_admission_tasks "
+        "WHERE authorization_id = ? AND task_id = ?",
+        (admission["authorization_id"], task_id),
+    ).fetchone()
+    if entry is None:
+        return False, "execution_admission_task_not_listed", context
+    if entry["execution_kind"] != "worker":
+        return False, "execution_admission_no_agent_task", context
+    if entry["allowed_claim_status"] != source_status:
+        return False, "execution_admission_claim_lane_mismatch", context
+    try:
+        identity = _task_execution_identity(conn, task_id)
+    except ExecutionAdmissionError:
+        return False, "execution_admission_task_missing", context
+    identity_json = _execution_admission_json(identity)
+    identity_sha256 = hashlib.sha256(identity_json.encode("utf-8")).hexdigest()
+    if (
+        identity_sha256 != entry["identity_sha256"]
+        or identity_json != entry["identity_json"]
+    ):
+        return False, "execution_admission_identity_mismatch", context
+    attempts = int(conn.execute(
+        "SELECT COUNT(*) FROM task_runs WHERE task_id = ?", (task_id,)
+    ).fetchone()[0])
+    if attempts >= 1:
+        return False, "execution_admission_attempt_spent", context
+    return True, None, context
+
+
+def _record_execution_admission_rejection(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    source_status: str,
+    reason: str,
+    context: Optional[Mapping[str, Any]],
+) -> None:
+    payload = {
+        "reason": reason,
+        "source_status": source_status,
+        **dict(context or {}),
+    }
+    last = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? "
+        "AND kind = 'execution_admission_rejected' ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if last is not None and last["payload"]:
+        try:
+            if json.loads(last["payload"]) == payload:
+                return
+        except (json.JSONDecodeError, TypeError):
+            pass
+    _append_event(conn, task_id, "execution_admission_rejected", payload)
+
+
 def _block_claim_at_attempt_limit(
     conn: sqlite3.Connection,
     task_id: str,
@@ -4777,6 +5527,18 @@ def claim_task(
             conn, task_id, source_status="ready",
         ):
             return None
+        admitted, admission_reason, admission_context = execution_admission_decision(
+            conn, task_id, source_status="ready",
+        )
+        if not admitted:
+            _record_execution_admission_rejection(
+                conn,
+                task_id,
+                source_status="ready",
+                reason=admission_reason or "execution_admission_denied",
+                context=admission_context,
+            )
+            return None
         # Defensive: if a prior run somehow leaked (invariant violation from
         # an unknown code path), close it as 'reclaimed' so we don't strand
         # it when the CAS resets the pointer below. No-op when the invariant
@@ -4844,7 +5606,16 @@ def claim_task(
         )
         _append_event(
             conn, task_id, "claimed",
-            {"lock": lock, "expires": expires, "run_id": run_id},
+            {
+                "lock": lock,
+                "expires": expires,
+                "run_id": run_id,
+                **(
+                    {"execution_admission": admission_context}
+                    if admission_context is not None
+                    else {}
+                ),
+            },
             run_id=run_id,
         )
         claimed = get_task(conn, task_id)
@@ -4901,6 +5672,18 @@ def claim_review_task(
             conn, task_id, source_status="review",
         ):
             return None
+        admitted, admission_reason, admission_context = execution_admission_decision(
+            conn, task_id, source_status="review",
+        )
+        if not admitted:
+            _record_execution_admission_rejection(
+                conn,
+                task_id,
+                source_status="review",
+                reason=admission_reason or "execution_admission_denied",
+                context=admission_context,
+            )
+            return None
         cur = conn.execute(
             """
             UPDATE tasks
@@ -4947,7 +5730,12 @@ def claim_review_task(
         _append_event(
             conn, task_id, "claimed",
             {"lock": lock, "expires": expires, "run_id": run_id,
-             "source_status": "review"},
+             "source_status": "review",
+             **(
+                 {"execution_admission": admission_context}
+                 if admission_context is not None
+                 else {}
+             )},
             run_id=run_id,
         )
         return get_task(conn, task_id)
@@ -8199,6 +8987,10 @@ class DispatchResult:
     Reasons: ``"blocker_auth"`` (quota/auth error — also auto-blocked),
     ``"recent_success"`` (completed run within guard window),
     ``"active_pr"`` (GitHub PR URL in a recent comment)."""
+    admission_guarded: list[tuple[str, str]] = field(default_factory=list)
+    """Tasks denied by the board's live execution admission, as
+    ``(task_id, reason)`` pairs. This is a durable safety gate rather than a
+    retry condition; the claim kernel independently re-checks it."""
     rate_limited: list[str] = field(default_factory=list)
     """Task ids whose workers bailed on a provider rate-limit / quota wall
     (EX_TEMPFAIL sentinel exit) and were released back to ``ready`` WITHOUT
@@ -9687,7 +10479,7 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     the warning still fires in degraded environments.
     """
     rows = conn.execute(
-        "SELECT DISTINCT assignee FROM tasks "
+        "SELECT id, assignee FROM tasks "
         "WHERE status = 'ready' AND assignee IS NOT NULL "
         "    AND claim_lock IS NULL"
     ).fetchall()
@@ -9699,7 +10491,10 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
         # Can't introspect — assume spawnable, preserve legacy behavior.
         return True
     for row in rows:
-        if profile_exists(row["assignee"]):
+        admitted, _, _ = execution_admission_decision(
+            conn, row["id"], source_status="ready",
+        )
+        if admitted and profile_exists(row["assignee"]):
             return True
     return False
 
@@ -9713,7 +10508,7 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
     should have spawned a review agent.
     """
     rows = conn.execute(
-        "SELECT DISTINCT assignee FROM tasks "
+        "SELECT id, assignee FROM tasks "
         "WHERE status = 'review' AND assignee IS NOT NULL "
         "    AND claim_lock IS NULL"
     ).fetchall()
@@ -9724,7 +10519,10 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
     except Exception:
         return True
     for row in rows:
-        if profile_exists(row["assignee"]):
+        admitted, _, _ = execution_admission_decision(
+            conn, row["id"], source_status="review",
+        )
+        if admitted and profile_exists(row["assignee"]):
             return True
     return False
 
@@ -10329,6 +11127,22 @@ def _dispatch_once_locked(
                     (row["id"], row_assignee, current)
                 )
                 continue
+        admitted, admission_reason, admission_context = execution_admission_decision(
+            conn, row["id"], source_status="ready",
+        )
+        if not admitted:
+            reason = admission_reason or "execution_admission_denied"
+            result.admission_guarded.append((row["id"], reason))
+            if not dry_run:
+                with write_txn(conn):
+                    _record_execution_admission_rejection(
+                        conn,
+                        row["id"],
+                        source_status="ready",
+                        reason=reason,
+                        context=admission_context,
+                    )
+            continue
         # Respawn guard: refuse to re-spawn when useful work is already
         # in-flight/recent, or when the last failure is a deterministic
         # blocker (quota / auth). The guard defers the spawn this tick so
@@ -10471,6 +11285,22 @@ def _dispatch_once_locked(
                     (row["id"], row["assignee"], current)
                 )
                 continue
+        admitted, admission_reason, admission_context = execution_admission_decision(
+            conn, row["id"], source_status="review",
+        )
+        if not admitted:
+            reason = admission_reason or "execution_admission_denied"
+            result.admission_guarded.append((row["id"], reason))
+            if not dry_run:
+                with write_txn(conn):
+                    _record_execution_admission_rejection(
+                        conn,
+                        row["id"],
+                        source_status="review",
+                        reason=reason,
+                        context=admission_context,
+                    )
+            continue
         guard_reason = check_respawn_guard(conn, row["id"], lane="review")
         if guard_reason is not None:
             result.respawn_guarded.append((row["id"], guard_reason))
