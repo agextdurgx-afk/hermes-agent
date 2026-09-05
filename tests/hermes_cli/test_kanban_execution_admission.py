@@ -129,6 +129,45 @@ def test_existing_launch_ledger_adds_exit_request_column(tmp_path):
     assert "exit_requested_at" in columns
 
 
+def test_existing_admission_ledger_adds_successor_provenance_columns(tmp_path):
+    db_path = tmp_path / "legacy-admission.db"
+    legacy_schema = kb.SCHEMA_SQL
+    for declaration in [
+        "    supersedes_authorization_id TEXT,\n",
+        "    superseded_by_authorization_id TEXT,\n",
+        "    succession_reason TEXT,\n",
+    ]:
+        legacy_schema = legacy_schema.replace(declaration, "")
+    assert legacy_schema != kb.SCHEMA_SQL
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.executescript(legacy_schema)
+    finally:
+        conn.close()
+    kb.init_db(db_path=db_path)
+    conn = sqlite3.connect(db_path)
+    try:
+        columns = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(execution_admissions)")
+        }
+        indexes = {
+            row[1]
+            for row in conn.execute("PRAGMA index_list(execution_admissions)")
+        }
+    finally:
+        conn.close()
+    assert {
+        "supersedes_authorization_id",
+        "superseded_by_authorization_id",
+        "succession_reason",
+    } <= columns
+    assert {
+        "idx_execution_admission_supersedes",
+        "idx_execution_admission_superseded_by",
+    } <= indexes
+
+
 def test_begin_is_deny_all_and_exact_replay_is_idempotent(kanban_home):
     with kb.connect() as conn:
         first = _begin(conn)
@@ -184,6 +223,251 @@ def test_different_live_authorization_cannot_replace_construction_barrier(
         assert kb.execution_admission_status(conn)["authorization_id"] == AUTH
 
 
+def test_sealed_barrier_is_atomically_replaced_by_fresh_prepared_deny_all(
+    kanban_home,
+):
+    replacement_auth = "replay:test:replacement:0002"
+    replacement_evidence = "b" * 64
+    with kb.connect() as conn:
+        _begin(conn)
+        old_worker = _task(conn, "failed collector")
+        old_bound = _bind(conn, [{
+            "task_id": old_worker,
+            "execution_kind": "worker",
+            "allowed_claim_status": "ready",
+        }])
+        _activate(conn, old_bound["policy_sha256"])
+        sealed = kb.seal_execution_admission(
+            conn,
+            authorization_id=AUTH,
+            generation=GENERATION,
+            policy_sha256=old_bound["policy_sha256"],
+            reason="failed collector remains permanently held",
+        )
+        assert sealed["state"] == "sealed"
+
+        replacement_worker = _task(conn, "replacement collector")
+        replaced = kb.replace_sealed_execution_admission(
+            conn,
+            sealed_authorization_id=AUTH,
+            sealed_generation=GENERATION,
+            sealed_evidence_sha256=EVIDENCE,
+            sealed_policy_sha256=old_bound["policy_sha256"],
+            authorization_id=replacement_auth,
+            generation=GENERATION + 1,
+            evidence_sha256=replacement_evidence,
+            reason="reviewed pre-capability infrastructure replacement",
+        )
+        assert replaced["state"] == "prepared"
+        assert replaced["live"] is True
+        assert replaced["policy_sha256"] is None
+        old = kb.execution_admission_status(conn, AUTH)
+        assert old["state"] == "closed"
+        assert old["live"] is False
+
+        # Replaying the exact replacement after commit is idempotent, and the
+        # new prepared row remains a deny-all barrier until separately bound.
+        assert kb.replace_sealed_execution_admission(
+            conn,
+            sealed_authorization_id=AUTH,
+            sealed_generation=GENERATION,
+            sealed_evidence_sha256=EVIDENCE,
+            sealed_policy_sha256=old_bound["policy_sha256"],
+            authorization_id=replacement_auth,
+            generation=GENERATION + 1,
+            evidence_sha256=replacement_evidence,
+            reason="reviewed pre-capability infrastructure replacement",
+        ) == replaced
+        allowed, reason, _context = kb.execution_admission_decision(
+            conn, replacement_worker, source_status="ready"
+        )
+        assert allowed is False
+        assert reason == "execution_admission_prepared_deny_all"
+
+        bound = kb.bind_execution_admission(
+            conn,
+            authorization_id=replacement_auth,
+            generation=GENERATION + 1,
+            evidence_sha256=replacement_evidence,
+            task_bindings=[{
+                "task_id": replacement_worker,
+                "execution_kind": "worker",
+                "allowed_claim_status": "ready",
+            }],
+        )
+        active = kb.activate_execution_admission(
+            conn,
+            authorization_id=replacement_auth,
+            generation=GENERATION + 1,
+            policy_sha256=bound["policy_sha256"],
+        )
+        assert active["state"] == "active"
+
+
+def test_sealed_barrier_replacement_refuses_executable_or_stale_state(
+    kanban_home,
+):
+    replacement = {
+        "sealed_authorization_id": AUTH,
+        "sealed_generation": GENERATION,
+        "sealed_evidence_sha256": EVIDENCE,
+        "authorization_id": "replay:test:replacement:0003",
+        "generation": GENERATION + 1,
+        "evidence_sha256": "c" * 64,
+        "reason": "reviewed pre-capability infrastructure replacement",
+    }
+    with kb.connect() as conn:
+        _begin(conn)
+        worker = _task(conn, "old collector")
+        bound = _bind(conn, [{
+            "task_id": worker,
+            "execution_kind": "worker",
+            "allowed_claim_status": "ready",
+        }])
+        replacement["sealed_policy_sha256"] = bound["policy_sha256"]
+        with pytest.raises(kb.ExecutionAdmissionError, match="CAS mismatch"):
+            kb.replace_sealed_execution_admission(conn, **replacement)
+        kb.seal_execution_admission(
+            conn,
+            authorization_id=AUTH,
+            generation=GENERATION,
+            policy_sha256=bound["policy_sha256"],
+            reason="ready for exact replacement review",
+        )
+        assert kb.unblock_task(conn, worker)
+        with pytest.raises(kb.ExecutionAdmissionError, match="executable work"):
+            kb.replace_sealed_execution_admission(conn, **replacement)
+        assert kb.execution_admission_status(conn)["authorization_id"] == AUTH
+        assert kb.execution_admission_status(conn)["state"] == "sealed"
+
+
+def test_sealed_barrier_replacement_rolls_back_if_successor_insert_fails(
+    kanban_home,
+):
+    replacement_auth = "replay:test:replacement:rollback"
+    with kb.connect() as conn:
+        _begin(conn)
+        worker = _task(conn, "rollback-safe predecessor")
+        bound = _bind(conn, [{
+            "task_id": worker,
+            "execution_kind": "worker",
+            "allowed_claim_status": "ready",
+        }])
+        kb.seal_execution_admission(
+            conn,
+            authorization_id=AUTH,
+            generation=GENERATION,
+            policy_sha256=bound["policy_sha256"],
+            reason="prepare transactional rollback proof",
+        )
+        conn.execute(
+            "CREATE TRIGGER fail_exact_successor BEFORE INSERT ON execution_admissions "
+            f"WHEN NEW.authorization_id = '{replacement_auth}' "
+            "BEGIN SELECT RAISE(ABORT, 'injected successor insert failure'); END"
+        )
+        conn.commit()
+        with pytest.raises(sqlite3.IntegrityError, match="injected successor"):
+            kb.replace_sealed_execution_admission(
+                conn,
+                sealed_authorization_id=AUTH,
+                sealed_generation=GENERATION,
+                sealed_evidence_sha256=EVIDENCE,
+                sealed_policy_sha256=bound["policy_sha256"],
+                authorization_id=replacement_auth,
+                generation=GENERATION + 1,
+                evidence_sha256="d" * 64,
+                reason="transaction must retain the sealed predecessor",
+            )
+        old = kb.execution_admission_status(conn, AUTH)
+        assert old["state"] == "sealed"
+        assert old["live"] is True
+        assert old["superseded_by_authorization_id"] is None
+        assert kb.execution_admission_status(conn, replacement_auth) is None
+
+
+@pytest.mark.parametrize("foreign_status", ["todo", "blocked"])
+def test_replacement_api_refuses_foreign_promotable_parked_work(
+    kanban_home, foreign_status,
+):
+    with kb.connect() as conn:
+        _begin(conn)
+        worker = _task(conn, "sealed predecessor for parked refusal")
+        bound = _bind(conn, [{
+            "task_id": worker,
+            "execution_kind": "worker",
+            "allowed_claim_status": "ready",
+        }])
+        kb.seal_execution_admission(
+            conn,
+            authorization_id=AUTH,
+            generation=GENERATION,
+            policy_sha256=bound["policy_sha256"],
+            reason="parked refusal proof",
+        )
+        foreign = _task(conn, f"replacement-foreign-{foreign_status}")
+        conn.execute(
+            "UPDATE tasks SET status = ?, block_kind = NULL, consecutive_failures = 0 "
+            "WHERE id = ?",
+            (foreign_status, foreign),
+        )
+        conn.commit()
+        with pytest.raises(kb.ExecutionAdmissionError, match="parked work is promotable"):
+            kb.replace_sealed_execution_admission(
+                conn,
+                sealed_authorization_id=AUTH,
+                sealed_generation=GENERATION,
+                sealed_evidence_sha256=EVIDENCE,
+                sealed_policy_sha256=bound["policy_sha256"],
+                authorization_id=f"replay:test:replacement:{foreign_status}",
+                generation=GENERATION + 1,
+                evidence_sha256="e" * 64,
+                reason="foreign promotable work must stop succession",
+            )
+        assert kb.execution_admission_status(conn, AUTH)["state"] == "sealed"
+
+
+def test_replacement_api_refuses_unknown_live_launch_state(kanban_home):
+    with kb.connect() as conn:
+        _begin(conn)
+        worker = _task(conn, "sealed predecessor for launch refusal")
+        bound = _bind(conn, [{
+            "task_id": worker,
+            "execution_kind": "worker",
+            "allowed_claim_status": "ready",
+        }])
+        kb.seal_execution_admission(
+            conn,
+            authorization_id=AUTH,
+            generation=GENERATION,
+            policy_sha256=bound["policy_sha256"],
+            reason="launch refusal proof",
+        )
+        conn.execute(
+            "INSERT INTO execution_launches (launch_id, authorization_id, task_id, run_id, claim_lock, claim_lane, "
+            "generation, policy_sha256, board_db_path, board_sha256, identity_sha256, nonce_sha256, state, dispatcher_pid, created_at) "
+            "VALUES (?, ?, ?, ?, ?, 'ready', ?, ?, ?, ?, ?, ?, 'spawning', ?, ?)",
+            (
+                "xl_unknown_replacement", AUTH, worker, 999, "foreign:claim", GENERATION,
+                bound["policy_sha256"], "/tmp/board", "1" * 64, "2" * 64,
+                "3" * 64, os.getpid(), int(time.time()),
+            ),
+        )
+        conn.commit()
+        with pytest.raises(kb.ExecutionAdmissionError, match="cannot replace while execution launch is spawning"):
+            kb.replace_sealed_execution_admission(
+                conn,
+                sealed_authorization_id=AUTH,
+                sealed_generation=GENERATION,
+                sealed_evidence_sha256=EVIDENCE,
+                sealed_policy_sha256=bound["policy_sha256"],
+                authorization_id="replay:test:replacement:launch-held",
+                generation=GENERATION + 1,
+                evidence_sha256="f" * 64,
+                reason="unknown live launch must stop succession",
+            )
+        assert kb.execution_admission_status(conn, AUTH)["state"] == "sealed"
+
+
 def test_concurrent_preparers_leave_exactly_one_live_barrier(kanban_home):
     barrier = threading.Barrier(2)
 
@@ -211,6 +495,137 @@ def test_concurrent_preparers_leave_exactly_one_live_barrier(kanban_home):
         live = kb.execution_admission_status(conn)
         assert live is not None
         assert live["authorization_id"] in {AUTH, "replay:test:0002"}
+
+
+def test_concurrent_sealed_successors_choose_exactly_one_live_barrier(
+    kanban_home,
+):
+    with kb.connect() as conn:
+        _begin(conn)
+        worker = _task(conn, "failed root for concurrent succession")
+        bound = _bind(conn, [{
+            "task_id": worker,
+            "execution_kind": "worker",
+            "allowed_claim_status": "ready",
+        }])
+        kb.seal_execution_admission(
+            conn,
+            authorization_id=AUTH,
+            generation=GENERATION,
+            policy_sha256=bound["policy_sha256"],
+            reason="concurrent successor selection test",
+        )
+
+    barrier = threading.Barrier(2)
+
+    def replace(authorization_id, evidence):
+        with kb.connect() as conn:
+            barrier.wait(timeout=5)
+            try:
+                result = kb.replace_sealed_execution_admission(
+                    conn,
+                    sealed_authorization_id=AUTH,
+                    sealed_generation=GENERATION,
+                    sealed_evidence_sha256=EVIDENCE,
+                    sealed_policy_sha256=bound["policy_sha256"],
+                    authorization_id=authorization_id,
+                    generation=GENERATION + 1,
+                    evidence_sha256=evidence,
+                    reason="one reviewed infrastructure successor only",
+                )
+                return ("ok", result["authorization_id"])
+            except kb.ExecutionAdmissionError as exc:
+                return ("error", str(exc))
+
+    candidates = [
+        ("replay:test:successor:a", "e" * 64),
+        ("replay:test:successor:b", "f" * 64),
+    ]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda args: replace(*args), candidates))
+    assert sorted(result[0] for result in results) == ["error", "ok"]
+    winner = next(result[1] for result in results if result[0] == "ok")
+    with kb.connect() as conn:
+        live = kb.execution_admission_status(conn)
+        old = kb.execution_admission_status(conn, AUTH)
+        assert live["authorization_id"] == winner
+        assert live["state"] == "prepared"
+        assert live["live"] is True
+        assert old["state"] == "closed"
+        assert old["superseded_by_authorization_id"] == winner
+
+
+def test_concurrent_ready_creation_cannot_escape_replacement_barrier(
+    kanban_home, monkeypatch,
+):
+    replacement_auth = "replay:test:replacement:dispatch-race"
+    with kb.connect() as conn:
+        _begin(conn)
+        worker = _task(conn, "sealed predecessor for dispatch race")
+        bound = _bind(conn, [{
+            "task_id": worker,
+            "execution_kind": "worker",
+            "allowed_claim_status": "ready",
+        }])
+        kb.seal_execution_admission(
+            conn,
+            authorization_id=AUTH,
+            generation=GENERATION,
+            policy_sha256=bound["policy_sha256"],
+            reason="dispatch race proof",
+        )
+
+    entered = threading.Event()
+    release = threading.Event()
+    original_assert = kb._assert_execution_admission_identities
+
+    def pause_inside_succession(conn, authorization_id):
+        original_assert(conn, authorization_id)
+        entered.set()
+        assert release.wait(timeout=5)
+
+    monkeypatch.setattr(
+        kb, "_assert_execution_admission_identities", pause_inside_succession,
+    )
+
+    def replace():
+        with kb.connect() as conn:
+            return kb.replace_sealed_execution_admission(
+                conn,
+                sealed_authorization_id=AUTH,
+                sealed_generation=GENERATION,
+                sealed_evidence_sha256=EVIDENCE,
+                sealed_policy_sha256=bound["policy_sha256"],
+                authorization_id=replacement_auth,
+                generation=GENERATION + 1,
+                evidence_sha256="9" * 64,
+                reason="concurrent dispatch must remain fenced",
+            )
+
+    def create_and_claim():
+        with kb.connect() as conn:
+            task_id = _task(conn, "concurrent foreign ready task")
+            conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (task_id,))
+            conn.commit()
+            return task_id, kb.claim_task(conn, task_id, claimer="race:dispatch")
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        replaced_future = pool.submit(replace)
+        assert entered.wait(timeout=5)
+        claim_future = pool.submit(create_and_claim)
+        time.sleep(0.05)
+        assert not claim_future.done()
+        release.set()
+        replaced = replaced_future.result(timeout=5)
+        task_id, claimed = claim_future.result(timeout=5)
+    assert replaced["authorization_id"] == replacement_auth
+    assert replaced["state"] == "prepared"
+    assert claimed is None
+    with kb.connect() as conn:
+        assert kb.get_task(conn, task_id).status == "ready"
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_runs WHERE task_id = ?", (task_id,)
+        ).fetchone()[0] == 0
 
 
 def test_active_admission_allows_only_exact_worker_identity(kanban_home):
@@ -2042,3 +2457,32 @@ def test_cli_requires_orchestrator_and_round_trips_exact_policy(
     assert _cli(["admission", "show", AUTH, "--json"]) == 0
     shown = json.loads(capsys.readouterr().out)
     assert shown["policy_sha256"] == bound["policy_sha256"]
+
+    assert _cli([
+        "admission", "seal", AUTH,
+        "--generation", str(GENERATION),
+        "--policy-sha256", bound["policy_sha256"],
+        "--reason", "CLI replacement contract test",
+        "--json",
+    ]) == 0
+    assert json.loads(capsys.readouterr().out)["state"] == "sealed"
+
+    replacement_auth = "replay:test:cli-replacement:0002"
+    assert _cli([
+        "admission", "replace-sealed", AUTH, replacement_auth,
+        "--sealed-generation", str(GENERATION),
+        "--sealed-evidence-sha256", EVIDENCE,
+        "--sealed-policy-sha256", bound["policy_sha256"],
+        "--generation", str(GENERATION + 1),
+        "--evidence-sha256", "d" * 64,
+        "--reason", "reviewed pre-capability infrastructure replacement",
+        "--json",
+    ]) == 0
+    replacement = json.loads(capsys.readouterr().out)
+    assert replacement["authorization_id"] == replacement_auth
+    assert replacement["state"] == "prepared"
+    assert replacement["live"] is True
+    with kb.connect() as conn:
+        old = kb.execution_admission_status(conn, AUTH)
+        assert old["state"] == "closed"
+        assert old["live"] is False

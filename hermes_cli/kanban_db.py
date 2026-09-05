@@ -1560,6 +1560,9 @@ CREATE TABLE IF NOT EXISTS execution_admissions (
     sealed_at        INTEGER,
     closed_at        INTEGER,
     terminal_reason  TEXT,
+    supersedes_authorization_id TEXT,
+    superseded_by_authorization_id TEXT,
+    succession_reason TEXT,
     CHECK (state IN ('prepared', 'active', 'sealed', 'closed')),
     CHECK (live_slot IS NULL OR live_slot = 1),
     CHECK ((state = 'closed' AND live_slot IS NULL) OR
@@ -3042,6 +3045,37 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
                 "exit_requested_at",
                 "exit_requested_at INTEGER",
             )
+
+    admission_table_exists = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' "
+        "AND name='execution_admissions'"
+    ).fetchone() is not None
+    if admission_table_exists:
+        admission_cols = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(execution_admissions)")
+        }
+        for column, declaration in [
+            ("supersedes_authorization_id", "supersedes_authorization_id TEXT"),
+            ("superseded_by_authorization_id", "superseded_by_authorization_id TEXT"),
+            ("succession_reason", "succession_reason TEXT"),
+        ]:
+            if column not in admission_cols:
+                _add_column_if_missing(
+                    conn, "execution_admissions", column, declaration
+                )
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS "
+            "idx_execution_admission_supersedes "
+            "ON execution_admissions(supersedes_authorization_id) "
+            "WHERE supersedes_authorization_id IS NOT NULL"
+        )
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS "
+            "idx_execution_admission_superseded_by "
+            "ON execution_admissions(superseded_by_authorization_id) "
+            "WHERE superseded_by_authorization_id IS NOT NULL"
+        )
 
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
@@ -5136,6 +5170,9 @@ def execution_admission_status(
         "sealed_at": row["sealed_at"],
         "closed_at": row["closed_at"],
         "terminal_reason": row["terminal_reason"],
+        "supersedes_authorization_id": row["supersedes_authorization_id"],
+        "superseded_by_authorization_id": row["superseded_by_authorization_id"],
+        "succession_reason": row["succession_reason"],
         "tasks": [
             {
                 "task_id": task["task_id"],
@@ -5793,6 +5830,211 @@ def close_execution_admission(
                 (now, authorization_id),
             )
     return execution_admission_status(conn, authorization_id) or {}
+
+
+def replace_sealed_execution_admission(
+    conn: sqlite3.Connection,
+    *,
+    sealed_authorization_id: str,
+    sealed_generation: int,
+    sealed_evidence_sha256: str,
+    sealed_policy_sha256: str,
+    authorization_id: str,
+    generation: int,
+    evidence_sha256: str,
+    reason: str,
+) -> dict[str, Any]:
+    """Atomically replace one exact sealed deny-all barrier with a new one.
+
+    This is deliberately narrower than ``close`` followed by ``begin``.  The
+    singleton ``live_slot`` moves inside one SQLite transaction while the
+    process-launch fence is held, so another process can never observe an
+    unguarded board between the failed authorization and its separately
+    reviewed replacement.  The new admission is born ``prepared`` and
+    therefore remains deny-all until its fresh task identities are bound and
+    activated through the ordinary admission protocol.
+    """
+    authorization_id, generation, evidence_sha256 = (
+        _validate_execution_admission_header(
+            authorization_id, generation, evidence_sha256
+        )
+    )
+    sealed_authorization_id = str(sealed_authorization_id or "").strip()
+    if not _EXECUTION_ADMISSION_ID_RE.fullmatch(sealed_authorization_id):
+        raise ExecutionAdmissionError(
+            "sealed_authorization_id must be 8-192 safe identifier characters"
+        )
+    try:
+        sealed_generation = int(sealed_generation)
+    except (TypeError, ValueError) as exc:
+        raise ExecutionAdmissionError(
+            "sealed_generation must be a positive integer"
+        ) from exc
+    sealed_policy_sha256 = str(sealed_policy_sha256 or "").strip().lower()
+    sealed_evidence_sha256 = str(sealed_evidence_sha256 or "").strip().lower()
+    reason = str(reason or "").strip()
+    if sealed_generation < 1:
+        raise ExecutionAdmissionError(
+            "sealed_generation must be a positive integer"
+        )
+    if not _EXECUTION_ADMISSION_SHA256_RE.fullmatch(sealed_policy_sha256):
+        raise ExecutionAdmissionError(
+            "sealed_policy_sha256 must be lowercase sha256"
+        )
+    if not _EXECUTION_ADMISSION_SHA256_RE.fullmatch(sealed_evidence_sha256):
+        raise ExecutionAdmissionError(
+            "sealed_evidence_sha256 must be lowercase sha256"
+        )
+    if len(reason) < 4 or len(reason) > 2000:
+        raise ExecutionAdmissionError(
+            "replacement reason must be 4-2000 characters"
+        )
+    if authorization_id == sealed_authorization_id:
+        raise ExecutionAdmissionError(
+            "replacement authorization_id must be new"
+        )
+    if generation <= sealed_generation:
+        raise ExecutionAdmissionError(
+            "replacement generation must advance the sealed generation"
+        )
+
+    now = int(time.time())
+    with _execution_launch_fence(conn):
+        with write_txn(conn):
+            sealed = conn.execute(
+                "SELECT * FROM execution_admissions WHERE authorization_id = ?",
+                (sealed_authorization_id,),
+            ).fetchone()
+            replacement = conn.execute(
+                "SELECT * FROM execution_admissions WHERE authorization_id = ?",
+                (authorization_id,),
+            ).fetchone()
+
+            # Exact replay after a committed replacement is idempotent.  A
+            # partially or differently replaced board always fails closed.
+            if replacement is not None:
+                if (
+                    sealed is None
+                    or sealed["state"] != "closed"
+                    or sealed["live_slot"] is not None
+                    or int(sealed["generation"]) != sealed_generation
+                    or sealed["evidence_sha256"] != sealed_evidence_sha256
+                    or sealed["policy_sha256"] != sealed_policy_sha256
+                    or sealed["closed_at"] != replacement["created_at"]
+                    or sealed["superseded_by_authorization_id"] != authorization_id
+                    or replacement["supersedes_authorization_id"] != sealed_authorization_id
+                    or sealed["succession_reason"] != reason
+                    or replacement["succession_reason"] != reason
+                ):
+                    raise ExecutionAdmissionError(
+                        "sealed execution admission was not closed by this replacement"
+                    )
+                if (
+                    int(replacement["generation"]) != generation
+                    or replacement["evidence_sha256"] != evidence_sha256
+                    or replacement["live_slot"] != 1
+                    or replacement["state"] == "closed"
+                ):
+                    raise ExecutionAdmissionError(
+                        "replacement authorization already exists with different immutable evidence"
+                    )
+                return execution_admission_status(conn, authorization_id) or {}
+
+            if sealed is None:
+                raise ExecutionAdmissionError("sealed execution admission not found")
+            if (
+                int(sealed["generation"]) != sealed_generation
+                or sealed["evidence_sha256"] != sealed_evidence_sha256
+                or sealed["policy_sha256"] != sealed_policy_sha256
+                or sealed["state"] != "sealed"
+                or sealed["live_slot"] != 1
+            ):
+                raise ExecutionAdmissionError(
+                    "sealed execution admission CAS mismatch"
+                )
+            if _execution_admission_policy_error(conn, sealed) is not None:
+                raise ExecutionAdmissionError(
+                    "sealed execution admission policy is invalid"
+                )
+            _assert_execution_admission_identities(
+                conn, sealed_authorization_id
+            )
+            _reconcile_execution_launch_exits_locked(
+                conn, authorization_id=sealed_authorization_id
+            )
+            live_launch = conn.execute(
+                "SELECT launch_id, authorization_id, state FROM execution_launches "
+                "WHERE state IN ('reserved','spawning','started','revoking') "
+                "ORDER BY created_at LIMIT 1"
+            ).fetchone()
+            if live_launch is not None:
+                raise ExecutionAdmissionError(
+                    "cannot replace while execution launch is "
+                    f"{live_launch['state']}: {live_launch['launch_id']}"
+                )
+            executable = conn.execute(
+                "SELECT id, status FROM tasks "
+                "WHERE status IN ('triage','ready','running','review') "
+                "ORDER BY id LIMIT 1"
+            ).fetchone()
+            if executable is not None:
+                raise ExecutionAdmissionError(
+                    "cannot replace while board has executable work: "
+                    f"{executable['id']} ({executable['status']})"
+                )
+            parked = conn.execute(
+                "SELECT id, status, consecutive_failures, max_retries, max_attempts "
+                "FROM tasks WHERE status IN ('todo','blocked') ORDER BY id"
+            ).fetchall()
+            promotable = next(
+                (
+                    row for row in parked
+                    if _foreign_parked_task_may_become_executable(conn, row)
+                ),
+                None,
+            )
+            if promotable is not None:
+                raise ExecutionAdmissionError(
+                    "cannot replace while parked work is promotable: "
+                    f"{promotable['id']} ({promotable['status']})"
+                )
+            live = _live_execution_admission(conn)
+            if live is None or live["authorization_id"] != sealed_authorization_id:
+                raise ExecutionAdmissionError(
+                    "sealed execution admission is not the singleton live barrier"
+                )
+
+            changed = conn.execute(
+                "UPDATE execution_admissions "
+                "SET state = 'closed', live_slot = NULL, closed_at = ?, "
+                "superseded_by_authorization_id = ?, succession_reason = ? "
+                "WHERE authorization_id = ? AND state = 'sealed' AND live_slot = 1",
+                (now, authorization_id, reason, sealed_authorization_id),
+            ).rowcount
+            if changed != 1:
+                raise ExecutionAdmissionError(
+                    "sealed execution admission replacement CAS failed"
+                )
+            conn.execute(
+                "INSERT INTO execution_admissions ("
+                "authorization_id, generation, evidence_sha256, state, live_slot, "
+                "created_at, supersedes_authorization_id, succession_reason"
+                ") VALUES (?, ?, ?, 'prepared', 1, ?, ?, ?)",
+                (
+                    authorization_id,
+                    generation,
+                    evidence_sha256,
+                    now,
+                    sealed_authorization_id,
+                    reason,
+                ),
+            )
+    status = execution_admission_status(conn, authorization_id)
+    if status is None:  # pragma: no cover - transaction invariant
+        raise ExecutionAdmissionError(
+            "replacement execution admission disappeared"
+        )
+    return status
 
 
 def execution_admission_decision(

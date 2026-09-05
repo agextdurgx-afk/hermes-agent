@@ -1120,6 +1120,20 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_admission_close.add_argument("--policy-sha256", required=True)
     p_admission_close.add_argument("--json", action="store_true")
 
+    p_admission_replace = admission_sub.add_parser(
+        "replace-sealed",
+        help="Atomically replace an exact sealed barrier with a fresh deny-all barrier",
+    )
+    p_admission_replace.add_argument("sealed_authorization_id")
+    p_admission_replace.add_argument("authorization_id")
+    p_admission_replace.add_argument("--sealed-generation", type=int, required=True)
+    p_admission_replace.add_argument("--sealed-evidence-sha256", required=True)
+    p_admission_replace.add_argument("--sealed-policy-sha256", required=True)
+    p_admission_replace.add_argument("--generation", type=int, required=True)
+    p_admission_replace.add_argument("--evidence-sha256", required=True)
+    p_admission_replace.add_argument("--reason", required=True)
+    p_admission_replace.add_argument("--json", action="store_true")
+
     p_admission_show = admission_sub.add_parser(
         "show", help="Show the live admission or one historical authorization",
     )
@@ -1365,7 +1379,7 @@ def _cmd_admission(args: argparse.Namespace) -> int:
     if not action:
         print(
             "usage: hermes kanban admission "
-            "{begin,bind,activate,seal,close,show} ...",
+            "{begin,bind,activate,seal,close,replace-sealed,show} ...",
             file=sys.stderr,
         )
         return 2
@@ -1459,6 +1473,18 @@ def _cmd_admission(args: argparse.Namespace) -> int:
                 authorization_id=args.authorization_id,
                 generation=args.generation,
                 policy_sha256=args.policy_sha256,
+            )
+        elif action == "replace-sealed":
+            status = kb.replace_sealed_execution_admission(
+                conn,
+                sealed_authorization_id=args.sealed_authorization_id,
+                sealed_generation=args.sealed_generation,
+                sealed_evidence_sha256=args.sealed_evidence_sha256,
+                sealed_policy_sha256=args.sealed_policy_sha256,
+                authorization_id=args.authorization_id,
+                generation=args.generation,
+                evidence_sha256=args.evidence_sha256,
+                reason=args.reason,
             )
         else:  # pragma: no cover - argparse constrains the subcommand
             print(f"kanban: unknown admission action {action!r}", file=sys.stderr)
