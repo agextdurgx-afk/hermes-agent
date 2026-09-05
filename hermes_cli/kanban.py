@@ -76,8 +76,17 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "result": t.result,
         "skills": list(t.skills) if t.skills else [],
         "max_retries": t.max_retries,
+        "max_attempts": t.max_attempts,
+        "max_runtime_seconds": t.max_runtime_seconds,
+        "idempotency_key": t.idempotency_key,
         "model_override": t.model_override,
         "provider_override": t.provider_override,
+        "reasoning_effort": t.reasoning_effort,
+        "goal_mode": t.goal_mode,
+        "goal_max_turns": t.goal_max_turns,
+        "current_run_id": t.current_run_id,
+        "worker_pid": t.worker_pid,
+        "consecutive_failures": t.consecutive_failures,
         "session_id": t.session_id,
         "workflow_template_id": t.workflow_template_id,
         "current_step_key": t.current_step_key,
@@ -408,6 +417,12 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "two retries. Omit to use the dispatcher's "
                                "kanban.failure_limit config "
                                f"(default {kb.DEFAULT_FAILURE_LIMIT}).")
+    p_create.add_argument("--max-attempts", type=int, default=None,
+                          metavar="N",
+                          help="Absolute cap on claimed worker runs. Unlike "
+                               "--max-retries this cannot be reset by "
+                               "unblocking; use --max-attempts 1 for a "
+                               "strictly one-shot task.")
     p_create.add_argument("--model", default=None, dest="model_override",
                           help="Pin the worker to this model (passed as "
                                "-m <model>) without changing the profile's "
@@ -1712,6 +1727,13 @@ def _cmd_create(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+    max_attempts = getattr(args, "max_attempts", None)
+    if max_attempts is not None and max_attempts < 1:
+        print(
+            f"kanban: --max-attempts must be >= 1 (got {max_attempts})",
+            file=sys.stderr,
+        )
+        return 2
     with kb.connect_closing() as conn:
         task_id = kb.create_task(
             conn,
@@ -1731,6 +1753,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             max_runtime_seconds=max_runtime,
             skills=getattr(args, "skills", None) or None,
             max_retries=max_retries,
+            max_attempts=max_attempts,
             model_override=getattr(args, "model_override", None),
             provider_override=getattr(args, "provider_override", None),
             goal_mode=bool(getattr(args, "goal_mode", False)),

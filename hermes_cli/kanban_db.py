@@ -1115,6 +1115,11 @@ class Task:
     # ``kanban.failure_limit`` config, and then to ``DEFAULT_FAILURE_LIMIT``.
     # Name matches the ``--max-retries`` CLI flag on ``kanban create``.
     max_retries: Optional[int] = None
+    # Absolute cap on worker attempts for tasks that must never be re-run.
+    # Unlike ``max_retries`` this counts claimed runs, not failures, so an
+    # explicit unblock or a stale-claim reclaim cannot reset the boundary.
+    # ``None`` preserves the ordinary retry lifecycle.
+    max_attempts: Optional[int] = None
     # When True, the dispatched worker runs in a Ralph-style goal loop
     # (the same engine behind the ``/goal`` slash command): after each
     # turn an auxiliary judge model evaluates the worker's response
@@ -1217,6 +1222,9 @@ class Task:
             ),
             max_retries=(
                 row["max_retries"] if "max_retries" in keys else None
+            ),
+            max_attempts=(
+                row["max_attempts"] if "max_attempts" in keys else None
             ),
             goal_mode=(
                 bool(row["goal_mode"]) if "goal_mode" in keys and row["goal_mode"] else False
@@ -1394,6 +1402,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- case) falls through to the dispatcher-level ``kanban.failure_limit``
     -- config and then ``DEFAULT_FAILURE_LIMIT``.
     max_retries          INTEGER,
+    -- Absolute worker-attempt cap. Unlike max_retries, this counts claimed
+    -- task_runs and cannot be reset by unblocking a task. NULL = unlimited.
+    max_attempts         INTEGER,
     -- When 1, the dispatched worker runs in a Ralph-style goal loop: an
     -- auxiliary judge re-evaluates the worker's response against the
     -- card title/body after each turn and feeds a continuation prompt
@@ -2634,6 +2645,11 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         # they were getting before the column existed).
         _add_column_if_missing(conn, "tasks", "max_retries", "max_retries INTEGER")
 
+    if "max_attempts" not in cols:
+        # Existing tasks remain unlimited. Callers opt into a hard attempt
+        # ceiling explicitly for one-shot/safety-critical work.
+        _add_column_if_missing(conn, "tasks", "max_attempts", "max_attempts INTEGER")
+
     if "model_override" not in cols:
         conn.execute("ALTER TABLE tasks ADD COLUMN model_override TEXT")
 
@@ -3184,6 +3200,7 @@ def create_task(
     max_runtime_seconds: Optional[int] = None,
     skills: Optional[Iterable[str]] = None,
     max_retries: Optional[int] = None,
+    max_attempts: Optional[int] = None,
     model_override: Optional[str] = None,
     provider_override: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
@@ -3246,6 +3263,8 @@ def create_task(
         raise ValueError(
             f"initial_status must be one of {sorted(VALID_INITIAL_STATUSES)}"
         )
+    if max_attempts is not None and int(max_attempts) < 1:
+        raise ValueError("max_attempts must be >= 1")
     if workspace_kind not in VALID_WORKSPACE_KINDS:
         raise ValueError(
             f"workspace_kind must be one of {sorted(VALID_WORKSPACE_KINDS)}, "
@@ -3506,10 +3525,10 @@ def create_task(
                         created_by, created_at, workspace_kind, workspace_path,
                         branch_name, project_id, tenant, idempotency_key,
                         max_runtime_seconds,
-                        skills, max_retries, model_override, provider_override,
+                        skills, max_retries, max_attempts, model_override, provider_override,
                         reasoning_effort,
                         goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3529,6 +3548,7 @@ def create_task(
                         int(max_runtime_seconds) if max_runtime_seconds is not None else None,
                         json.dumps(skills_list) if skills_list is not None else None,
                         int(max_retries) if max_retries is not None else None,
+                        int(max_attempts) if max_attempts is not None else None,
                         model_override,
                         provider_override,
                         reasoning_effort,
@@ -4644,6 +4664,74 @@ def _parents_satisfied(conn: sqlite3.Connection, task_id: str) -> bool:
     ).fetchone() is None
 
 
+def _block_claim_at_attempt_limit(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    source_status: str,
+) -> bool:
+    """Atomically refuse a claim after an absolute attempt cap is spent.
+
+    ``max_retries`` bounds consecutive failures and can intentionally be reset
+    by an operator unblock. ``max_attempts`` is different: it counts durable
+    ``task_runs`` rows and therefore cannot be bypassed by reclaiming, parking,
+    or unblocking a task. The sticky blocked event prevents recompute_ready()
+    from turning the refused claim into a dispatch loop.
+    """
+    row = conn.execute(
+        "SELECT max_attempts, current_run_id FROM tasks "
+        "WHERE id = ? AND status = ? AND claim_lock IS NULL",
+        (task_id, source_status),
+    ).fetchone()
+    if row is None or row["max_attempts"] is None:
+        return False
+    limit = int(row["max_attempts"])
+    attempts = int(conn.execute(
+        "SELECT COUNT(*) FROM task_runs WHERE task_id = ?",
+        (task_id,),
+    ).fetchone()[0])
+    if attempts < limit:
+        return False
+
+    # A ready/review task should not retain an open run. If legacy or external
+    # state violated that invariant, close it before installing the terminal
+    # refusal so the task and run tables agree after this transaction.
+    prior_run_id = row["current_run_id"]
+    if prior_run_id is not None:
+        _end_run(
+            conn,
+            task_id,
+            outcome="reclaimed",
+            status="reclaimed",
+            summary="attempt limit invariant recovery",
+        )
+    reason = f"absolute worker attempt limit reached ({attempts}/{limit})"
+    cur = conn.execute(
+        "UPDATE tasks SET status = 'blocked', claim_lock = NULL, "
+        "claim_expires = NULL, worker_pid = NULL, current_run_id = NULL, "
+        "last_failure_error = ? "
+        "WHERE id = ? AND status = ? AND claim_lock IS NULL",
+        (reason, task_id, source_status),
+    )
+    if cur.rowcount != 1:
+        return False
+    _append_event(
+        conn,
+        task_id,
+        "blocked",
+        {
+            "reason": reason,
+            "kind": "needs_input",
+            "source_status": source_status,
+            "attempts": attempts,
+            "max_attempts": limit,
+            "attempt_limit": True,
+        },
+        run_id=int(prior_run_id) if prior_run_id is not None else None,
+    )
+    return True
+
+
 def claim_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -4684,6 +4772,10 @@ def claim_task(
                 conn, task_id, "claim_rejected",
                 {"reason": "parents_not_done"},
             )
+            return None
+        if _block_claim_at_attempt_limit(
+            conn, task_id, source_status="ready",
+        ):
             return None
         # Defensive: if a prior run somehow leaked (invariant violation from
         # an unknown code path), close it as 'reclaimed' so we don't strand
@@ -4804,6 +4896,10 @@ def claim_review_task(
                         "source_status": "review",
                     },
                 )
+            return None
+        if _block_claim_at_attempt_limit(
+            conn, task_id, source_status="review",
+        ):
             return None
         cur = conn.execute(
             """

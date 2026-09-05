@@ -16,6 +16,7 @@ import pytest
 
 import hermes_state
 from hermes_cli import kanban_db as kb
+from hermes_cli.kanban import _task_to_dict
 
 
 @pytest.fixture
@@ -223,6 +224,53 @@ def test_initial_scheduled_task_is_atomic_and_schedule_replay_is_idempotent(
         assert [(event.kind, event.payload) for event in after] == [
             (event.kind, event.payload) for event in before
         ]
+
+
+def test_absolute_attempt_limit_survives_reclaim_and_explicit_unblock(
+    kanban_home, monkeypatch,
+):
+    """A one-shot task can never acquire a second worker claim."""
+    with kb.connect() as conn:
+        t = kb.create_task(
+            conn,
+            title="strict one shot",
+            assignee="ops",
+            initial_status="scheduled",
+            max_runtime_seconds=900,
+            max_retries=1,
+            max_attempts=1,
+        )
+        assert kb.unblock_task(conn, t) is True
+        claimed = kb.claim_task(conn, t, claimer="fixture:one")
+        assert claimed is not None
+        conn.execute(
+            "UPDATE tasks SET claim_expires = ? WHERE id = ?",
+            (int(time.time()) - 1, t),
+        )
+        conn.commit()
+        monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+        assert kb.release_stale_claims(
+            conn, signal_fn=lambda _pid, _sig: None,
+        ) == 1
+        assert kb.get_task(conn, t).status == "ready"
+
+        # The gateway's next claim attempt installs a sticky terminal block
+        # instead of opening a second task_run.
+        assert kb.claim_task(conn, t, claimer="fixture:two") is None
+        assert kb.get_task(conn, t).status == "blocked"
+        assert len(kb.list_runs(conn, t)) == 1
+        assert kb.list_events(conn, t)[-1].payload["attempt_limit"] is True
+
+        # Even an explicit unblock cannot reset an absolute attempt cap.
+        assert kb.unblock_task(conn, t) is True
+        assert kb.claim_task(conn, t, claimer="fixture:three") is None
+        assert kb.get_task(conn, t).status == "blocked"
+        assert len(kb.list_runs(conn, t)) == 1
+
+        public = _task_to_dict(kb.get_task(conn, t))
+        assert public["max_attempts"] == 1
+        assert public["max_runtime_seconds"] == 900
+        assert public["idempotency_key"] is None
 
 
 
