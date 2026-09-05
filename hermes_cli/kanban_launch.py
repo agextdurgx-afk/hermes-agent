@@ -24,6 +24,7 @@ class WorkerLaunchAuthorizationError(RuntimeError):
 
 _CONSUMED: Optional[dict[str, Any]] = None
 _FINISHED = False
+_READ_ONLY_INSPECTION_DB: Optional[Path] = None
 
 
 def _is_read_only_kanban_cli(argv: list[str]) -> bool:
@@ -81,6 +82,20 @@ def _required_env(name: str) -> str:
     if not value:
         raise WorkerLaunchAuthorizationError(f"missing {name}")
     return value
+
+
+def take_read_only_execution_inspection_db() -> Optional[Path]:
+    """Consume the bootstrap-granted, in-process inspection capability.
+
+    The capability is deliberately kept out of the environment so a child
+    process cannot inherit or replay it.  Only the modern CLI bootstrap can
+    mint it, after matching the exact ``kanban show`` argv grammar and an
+    already-existing explicitly pinned board database.
+    """
+    global _READ_ONLY_INSPECTION_DB
+    db_path = _READ_ONLY_INSPECTION_DB
+    _READ_ONLY_INSPECTION_DB = None
+    return db_path
 
 
 def _read_startup_secret(timeout_seconds: float = 30.0) -> dict[str, str]:
@@ -179,7 +194,7 @@ def require_execution_launch(
     grammar.  Legacy ``cli.py`` is Fire-driven and interprets those same words
     as agent input, so it must always leave this flag false.
     """
-    global _CONSUMED
+    global _CONSUMED, _READ_ONLY_INSPECTION_DB
     if _CONSUMED is not None:
         return dict(_CONSUMED)
     marker_present = os.environ.get("HERMES_KANBAN_LAUNCH_REQUIRED") == "1"
@@ -188,6 +203,18 @@ def require_execution_launch(
         if not task_id:
             return None
         if allow_read_only_kanban and _is_read_only_kanban_cli(sys.argv[1:]):
+            db_raw = str(os.environ.get("HERMES_KANBAN_DB") or "").strip()
+            if not db_raw:
+                raise WorkerLaunchAuthorizationError(
+                    "read-only Kanban inspection is missing HERMES_KANBAN_DB"
+                )
+            db_path = Path(db_raw).expanduser().resolve()
+            if not db_path.is_file():
+                raise WorkerLaunchAuthorizationError(
+                    "read-only Kanban inspection requires an existing board "
+                    f"database: {db_path}"
+                )
+            _READ_ONLY_INSPECTION_DB = db_path
             return None
         db_raw = str(os.environ.get("HERMES_KANBAN_DB") or "").strip()
         if not db_raw:

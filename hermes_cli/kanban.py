@@ -19,6 +19,7 @@ import contextlib
 import json
 import os
 import shlex
+import sqlite3
 import sys
 import time
 from pathlib import Path
@@ -1155,6 +1156,34 @@ def kanban_command(args: argparse.Namespace) -> int:
             )
         return 0
 
+    # The modern startup bootstrap may grant exactly one in-process
+    # ``kanban show`` inspection for the current worker task.  Consume that
+    # capability before any generic board resolution or auto-initialization:
+    # those ordinary paths are intentionally write-capable and may migrate a
+    # legacy board even when the requested command only reads.
+    from hermes_cli.kanban_launch import take_read_only_execution_inspection_db
+
+    inspection_db = take_read_only_execution_inspection_db()
+    if inspection_db is not None:
+        expected_task_id = str(
+            os.environ.get("HERMES_KANBAN_TASK") or ""
+        ).strip()
+        if action != "show" or args.task_id != expected_task_id:
+            print(
+                "kanban: read-only worker inspection is limited to its exact task",
+                file=sys.stderr,
+            )
+            return 1
+        try:
+            with kb.connect_readonly_closing(db_path=inspection_db) as conn:
+                return int(_cmd_show(args, _connection=conn) or 0)
+        except (OSError, sqlite3.Error, ValueError, RuntimeError) as exc:
+            print(
+                f"kanban: read-only inspection refused: {exc}",
+                file=sys.stderr,
+            )
+            return 1
+
     # Fast-fail for clearer CLI UX only. The durable trust boundary is lower in
     # hermes_cli.kanban_db, because children can import DB mutators directly.
     if _is_delegated_child_cli_mutation(args):
@@ -2036,7 +2065,11 @@ def _cmd_list(args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_show(args: argparse.Namespace) -> int:
+def _cmd_show(
+    args: argparse.Namespace,
+    *,
+    _connection: Optional[sqlite3.Connection] = None,
+) -> int:
     rsk = _run_state_kwargs(args)
     if rsk is None:
         print(
@@ -2044,12 +2077,10 @@ def _cmd_show(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
-    graph = None
-    with kb.connect_closing() as conn:
+    def load(conn: sqlite3.Connection):
         task = kb.get_task(conn, args.task_id)
         if not task:
-            print(f"no such task: {args.task_id}", file=sys.stderr)
-            return 1
+            return None
         comments = kb.list_comments(conn, args.task_id)
         events = kb.list_events(conn, args.task_id)
         parents = kb.parent_ids(conn, args.task_id)
@@ -2059,8 +2090,31 @@ def _cmd_show(args: argparse.Namespace) -> int:
         # ``result=``. Surfacing the latest summary here keeps ``show`` from
         # looking like a no-op when the worker actually did real work.
         latest_summary = kb.latest_summary(conn, args.task_id)
-        if not getattr(args, "json", False):
-            graph = kb.task_graph_context(conn, task.id)
+        graph = (
+            None
+            if getattr(args, "json", False)
+            else kb.task_graph_context(conn, task.id)
+        )
+        return (
+            task,
+            comments,
+            events,
+            parents,
+            children,
+            runs,
+            latest_summary,
+            graph,
+        )
+
+    if _connection is None:
+        with kb.connect_closing() as conn:
+            loaded = load(conn)
+    else:
+        loaded = load(_connection)
+    if loaded is None:
+        print(f"no such task: {args.task_id}", file=sys.stderr)
+        return 1
+    task, comments, events, parents, children, runs, latest_summary, graph = loaded
 
     if getattr(args, "json", False):
         payload = {

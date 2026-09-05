@@ -1260,6 +1260,145 @@ def test_worker_environment_allows_read_only_kanban_inspection(
         assert b"inspection-import-ok" in proc.stdout
 
 
+def test_real_read_only_show_preserves_legacy_board_bytes_and_events(
+    kanban_home,
+):
+    with kb.connect() as conn:
+        worker, _bound = _activate_one_worker(conn, "read-only-real-command")
+        event_id = conn.execute(
+            "SELECT id FROM task_events WHERE task_id = ? ORDER BY id LIMIT 1",
+            (worker,),
+        ).fetchone()["id"]
+        conn.execute(
+            "UPDATE task_events SET kind = 'ready' WHERE id = ?",
+            (event_id,),
+        )
+        conn.commit()
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        db_path = kb._connection_db_path(conn)
+
+    before = db_path.read_bytes()
+    env = dict(os.environ)
+    env.pop("HERMES_KANBAN_LAUNCH_REQUIRED", None)
+    env.update({
+        "HERMES_KANBAN_DB": str(db_path),
+        "HERMES_KANBAN_TASK": worker,
+    })
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "hermes_cli.main",
+            "kanban",
+            "show",
+            worker,
+            "--json",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+        timeout=20,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr.decode("utf-8", errors="replace")
+    payload = json.loads(proc.stdout)
+    assert payload["task"]["id"] == worker
+    assert any(event["kind"] == "ready" for event in payload["events"])
+    assert db_path.read_bytes() == before
+
+    raw = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)
+    try:
+        assert raw.execute(
+            "SELECT kind FROM task_events WHERE id = ?", (event_id,)
+        ).fetchone()[0] == "ready"
+    finally:
+        raw.close()
+
+
+def test_read_only_board_connection_denies_sql_and_pragma_mutation(
+    kanban_home,
+):
+    with kb.connect() as conn:
+        worker = _task(conn, "read-only-authorizer")
+        db_path = kb._connection_db_path(conn)
+
+    with kb.connect_readonly_closing(db_path=db_path) as conn:
+        assert kb.get_task(conn, worker).id == worker
+        with pytest.raises(sqlite3.DatabaseError, match="not authorized"):
+            conn.execute(
+                "UPDATE tasks SET title = 'mutated' WHERE id = ?",
+                (worker,),
+            )
+        with pytest.raises(sqlite3.DatabaseError, match="not authorized"):
+            conn.execute("PRAGMA query_only=OFF")
+
+
+def test_read_only_show_refuses_absent_board_without_creating_it(
+    tmp_path,
+):
+    missing = tmp_path / "missing" / "kanban.db"
+    task_id = "t_missingboard"
+    env = dict(os.environ)
+    env.pop("HERMES_KANBAN_LAUNCH_REQUIRED", None)
+    env.update({
+        "HERMES_KANBAN_DB": str(missing),
+        "HERMES_KANBAN_TASK": task_id,
+    })
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "hermes_cli.main",
+            "kanban",
+            "show",
+            task_id,
+            "--json",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+        timeout=20,
+        check=False,
+    )
+    assert proc.returncode != 0
+    assert b"requires an existing board database" in proc.stderr
+    assert not missing.exists()
+    assert not missing.parent.exists()
+
+
+def test_read_only_show_refuses_corrupt_board_without_changing_it(tmp_path):
+    corrupt = tmp_path / "kanban.db"
+    original = b"not a sqlite database\n"
+    corrupt.write_bytes(original)
+    task_id = "t_corruptboard"
+    env = dict(os.environ)
+    env.pop("HERMES_KANBAN_LAUNCH_REQUIRED", None)
+    env.update({
+        "HERMES_KANBAN_DB": str(corrupt),
+        "HERMES_KANBAN_TASK": task_id,
+    })
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "hermes_cli.main",
+            "kanban",
+            "show",
+            task_id,
+            "--json",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+        timeout=20,
+        check=False,
+    )
+    assert proc.returncode != 0
+    assert b"read-only inspection refused" in proc.stderr
+    assert corrupt.read_bytes() == original
+    assert not list(tmp_path.glob("kanban.db.corrupt.*"))
+
+
 def test_worker_environment_rejects_agent_override_before_kanban_show(
     kanban_home, tmp_path,
 ):

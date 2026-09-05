@@ -161,6 +161,44 @@ KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
 _IS_WINDOWS = sys.platform == "win32"
 KANBAN_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024
 
+_READ_ONLY_SQLITE_DENIED_ACTIONS = frozenset(
+    action
+    for name in (
+        "SQLITE_CREATE_INDEX",
+        "SQLITE_CREATE_TABLE",
+        "SQLITE_CREATE_TEMP_INDEX",
+        "SQLITE_CREATE_TEMP_TABLE",
+        "SQLITE_CREATE_TEMP_TRIGGER",
+        "SQLITE_CREATE_TEMP_VIEW",
+        "SQLITE_CREATE_TRIGGER",
+        "SQLITE_CREATE_VIEW",
+        "SQLITE_DELETE",
+        "SQLITE_DROP_INDEX",
+        "SQLITE_DROP_TABLE",
+        "SQLITE_DROP_TEMP_INDEX",
+        "SQLITE_DROP_TEMP_TABLE",
+        "SQLITE_DROP_TEMP_TRIGGER",
+        "SQLITE_DROP_TEMP_VIEW",
+        "SQLITE_DROP_TRIGGER",
+        "SQLITE_DROP_VIEW",
+        "SQLITE_INSERT",
+        "SQLITE_PRAGMA",
+        "SQLITE_UPDATE",
+        "SQLITE_ATTACH",
+        "SQLITE_DETACH",
+        "SQLITE_ALTER_TABLE",
+        "SQLITE_REINDEX",
+        "SQLITE_ANALYZE",
+        "SQLITE_CREATE_VTABLE",
+        "SQLITE_DROP_VTABLE",
+    )
+    if (action := getattr(sqlite3, name, None)) is not None
+)
+
+_READ_ONLY_SHOW_TABLES = frozenset(
+    {"tasks", "task_comments", "task_events", "task_links", "task_runs"}
+)
+
 
 def _assert_not_delegated_child_mutation() -> None:
     """Reject Kanban state mutations from ``delegate_task`` child contexts.
@@ -2662,6 +2700,91 @@ def connect(
     return conn
 
 
+def connect_readonly(
+    db_path: Optional[Path] = None,
+    *,
+    board: Optional[str] = None,
+) -> sqlite3.Connection:
+    """Open an existing Kanban board for one coherent, non-mutating read.
+
+    Unlike :func:`connect`, this path never creates parent directories, opens
+    SQLite read/write, initializes schema, migrates legacy rows, repairs
+    indexes, changes journal settings, or updates the initialized-path cache.
+    It is the only connection admitted for an execution worker's narrowly
+    scoped ``kanban show`` inspection.
+    """
+    path = db_path if db_path is not None else kanban_db_path(board=board)
+    try:
+        resolved = path.expanduser().resolve(strict=True)
+    except (FileNotFoundError, OSError) as exc:
+        raise RuntimeError(
+            f"read-only Kanban board does not exist: {path}"
+        ) from exc
+    if not resolved.is_file() or resolved.stat().st_size == 0:
+        raise RuntimeError(
+            f"read-only Kanban board is not an existing database: {resolved}"
+        )
+
+    busy_timeout_ms = _resolve_busy_timeout_ms()
+    uri = f"{resolved.as_uri()}?mode=ro"
+    conn: Optional[sqlite3.Connection] = None
+    try:
+        conn = sqlite3.connect(
+            uri,
+            uri=True,
+            isolation_level=None,
+            timeout=busy_timeout_ms / 1000.0,
+        )
+        conn.row_factory = sqlite3.Row
+        conn.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
+        conn.execute("PRAGMA query_only=ON")
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("BEGIN")
+
+        integrity = [
+            str(row[0]).strip().lower()
+            for row in conn.execute("PRAGMA quick_check(1)").fetchall()
+        ]
+        if integrity != ["ok"]:
+            raise RuntimeError(
+                "read-only Kanban board failed integrity check: "
+                + "; ".join(integrity or ["no result"])
+            )
+        tables = {
+            str(row["name"])
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        missing = sorted(_READ_ONLY_SHOW_TABLES - tables)
+        if missing:
+            raise RuntimeError(
+                "read-only Kanban board lacks required schema: "
+                + ", ".join(missing)
+            )
+
+        def deny_mutation(
+            action: int,
+            _arg1: Optional[str],
+            _arg2: Optional[str],
+            _database: Optional[str],
+            _trigger: Optional[str],
+        ) -> int:
+            if action in _READ_ONLY_SQLITE_DENIED_ACTIONS:
+                return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+
+        conn.set_authorizer(deny_mutation)
+        return conn
+    except BaseException:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        raise
+
+
 @contextlib.contextmanager
 def connect_closing(
     db_path: Optional[Path] = None,
@@ -2688,6 +2811,23 @@ def connect_closing(
     callers) continue to work.
     """
     conn = connect(db_path=db_path, board=board)
+    try:
+        yield conn
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@contextlib.contextmanager
+def connect_readonly_closing(
+    db_path: Optional[Path] = None,
+    *,
+    board: Optional[str] = None,
+):
+    """Open :func:`connect_readonly` and guarantee the snapshot is closed."""
+    conn = connect_readonly(db_path=db_path, board=board)
     try:
         yield conn
     finally:
