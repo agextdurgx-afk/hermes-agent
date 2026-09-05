@@ -53,6 +53,38 @@ def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 # ---------------------------------------------------------------------------
 
 
+def test_initial_blocked_task_is_atomically_sticky_until_explicit_unblock(
+    kanban_home: Path,
+) -> None:
+    """Initial blocked creation must not expose a promotable row."""
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="parked at birth",
+            assignee="ops",
+            initial_status="blocked",
+        )
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked"
+
+        events = kb.list_events(conn, tid)
+        assert [event.kind for event in events] == ["created", "blocked"]
+        assert events[-1].payload == {
+            "reason": "initial_status=blocked",
+            "kind": "needs_input",
+            "recurrences": 0,
+            "source_status": "ready",
+            "initial": True,
+        }
+
+        for _ in range(3):
+            assert kb.recompute_ready(conn) == 0
+            assert kb.get_task(conn, tid).status == "blocked"
+
+        assert kb.unblock_task(conn, tid) is True
+        assert kb.get_task(conn, tid).status == "ready"
+
+
 def test_worker_block_is_not_auto_promoted_by_recompute_ready(kanban_home: Path) -> None:
     """A standalone task that a worker explicitly blocks for review
     must stay blocked across an arbitrary number of dispatcher ticks.

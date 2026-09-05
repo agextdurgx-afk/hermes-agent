@@ -100,7 +100,7 @@ _log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
-VALID_INITIAL_STATUSES = {"running", "blocked"}
+VALID_INITIAL_STATUSES = {"running", "blocked", "scheduled"}
 
 # Typed block reasons. Distinguishes the two fundamentally different things a
 # worker (or human) means by "blocked", so each can be routed differently
@@ -3452,8 +3452,8 @@ def create_task(
                 # Determine task status from parent status, unless the caller
                 # parks it directly in blocked for human-ops review or in
                 # triage for a specifier.
-                if initial_status == "blocked":
-                    task_status = "blocked"
+                if initial_status in {"blocked", "scheduled"}:
+                    task_status = initial_status
                     if parents:
                         missing = _find_missing_parents(conn, parents)
                         if missing:
@@ -3565,6 +3565,25 @@ def create_task(
                         "provider_override": provider_override,
                     },
                 )
+                if initial_status == "blocked":
+                    # A blocked row without a matching blocked event is not
+                    # sticky: recompute_ready() treats it like a recoverable
+                    # circuit-breaker result and may promote it immediately.
+                    # Record the operator-requested initial park in the same
+                    # transaction as creation so no dispatcher can observe a
+                    # promotable intermediate task.
+                    _append_event(
+                        conn,
+                        task_id,
+                        "blocked",
+                        {
+                            "reason": "initial_status=blocked",
+                            "kind": "needs_input",
+                            "recurrences": 0,
+                            "source_status": "ready",
+                            "initial": True,
+                        },
+                    )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
             return task_id
         except sqlite3.IntegrityError:
@@ -7934,7 +7953,9 @@ def schedule_task(
 
     ``scheduled`` tasks are intentionally not dispatchable; an external cron,
     human action, or automation can later call ``unblock_task`` to re-gate them
-    to ``ready`` (or ``todo`` if parents are still incomplete).
+    to ``ready`` (or ``todo`` if parents are still incomplete). Scheduling an
+    already-scheduled task is an idempotent success and writes no duplicate
+    run or event.
     """
     with write_txn(conn):
         params: list[Any] = [task_id]
@@ -7952,6 +7973,13 @@ def schedule_task(
             params.append(int(expected_run_id))
         cur = conn.execute(sql, params)
         if cur.rowcount != 1:
+            if expected_run_id is None:
+                existing = conn.execute(
+                    "SELECT status FROM tasks WHERE id = ?",
+                    (task_id,),
+                ).fetchone()
+                if existing is not None and existing["status"] == "scheduled":
+                    return True
             return False
         run_id = _end_run(
             conn, task_id,

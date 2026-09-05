@@ -200,6 +200,31 @@ def test_schedule_task_parks_time_delay_without_dispatching(kanban_home):
         assert any(e.kind == "scheduled" and e.payload == {"reason": "run next week"} for e in events)
 
 
+def test_initial_scheduled_task_is_atomic_and_schedule_replay_is_idempotent(
+    kanban_home,
+):
+    with kb.connect() as conn:
+        t = kb.create_task(
+            conn,
+            title="atomically parked",
+            assignee="ops",
+            initial_status="scheduled",
+        )
+        assert kb.get_task(conn, t).status == "scheduled"
+        assert kb.claim_task(conn, t) is None
+        assert kb.recompute_ready(conn) == 0
+
+        before = kb.list_events(conn, t)
+        assert [event.kind for event in before] == ["created"]
+        assert before[0].payload["status"] == "scheduled"
+
+        assert kb.schedule_task(conn, t, reason="idempotent replay") is True
+        after = kb.list_events(conn, t)
+        assert [(event.kind, event.payload) for event in after] == [
+            (event.kind, event.payload) for event in before
+        ]
+
+
 
 
 
