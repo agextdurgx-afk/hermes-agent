@@ -694,6 +694,81 @@ def test_boolean_liveness_failure_cannot_certify_process_death(
             )
 
 
+def test_crash_detector_never_falls_back_to_legacy_for_revoking_launch(
+    kanban_home, monkeypatch,
+):
+    with kb.connect() as conn:
+        worker, _bound = _activate_one_worker(conn, "crash-fallback-fence")
+        claimed = kb.claim_task(
+            conn,
+            worker,
+            claimer=f"{kb._claimer_id().split(':', 1)[0]}:crash-fallback",
+        )
+        assert claimed is not None
+        with kb._execution_launch_fence(conn):
+            kb._mark_execution_launch_spawning(
+                conn, claimed, str(Path(claimed.workspace_path)),
+            )
+            kb._set_worker_pid(
+                conn,
+                worker,
+                os.getpid(),
+                expected_run_id=claimed.current_run_id,
+                expected_claim_lock=claimed.claim_lock,
+                execution_launch_id=claimed.execution_launch_id,
+            )
+        kb.consume_execution_launch(
+            conn,
+            launch_id=claimed.execution_launch_id,
+            nonce=claimed.execution_launch_nonce,
+            task_id=worker,
+            run_id=claimed.current_run_id,
+            claim_lock=claimed.claim_lock,
+            worker_pid=os.getpid(),
+        )
+
+        def denied(_pid, _signal):
+            raise PermissionError("test denies termination")
+
+        assert kb.reclaim_task(
+            conn,
+            worker,
+            reason="leave exact launch revoking",
+            signal_fn=denied,
+        ) is False
+        monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+        monkeypatch.setattr(kb, "_resolve_crash_grace_seconds", lambda: 0)
+        monkeypatch.setattr(
+            kb,
+            "_observe_execution_process_identity",
+            lambda pid, expected: {
+                "state": "unknown",
+                "pid": pid,
+                "expected_start_time": expected,
+                "observed_start_time": None,
+                "reason": "adversarial status probe failure",
+            },
+        )
+
+        assert kb.detect_crashed_workers(conn) == []
+        task = kb.get_task(conn, worker)
+        assert task is not None
+        assert task.status == "running"
+        assert task.current_run_id == claimed.current_run_id
+        assert task.claim_lock == claimed.claim_lock
+        launch = conn.execute(
+            "SELECT state FROM execution_launches WHERE launch_id = ?",
+            (claimed.execution_launch_id,),
+        ).fetchone()
+        assert launch["state"] == "revoking"
+        run = conn.execute(
+            "SELECT ended_at, outcome FROM task_runs WHERE id = ?",
+            (claimed.current_run_id,),
+        ).fetchone()
+        assert run["ended_at"] is None
+        assert run["outcome"] is None
+
+
 def test_process_observer_uses_registration_birth_marker_representation():
     expected = kb._worker_process_start_time(os.getpid())
     assert expected is not None
@@ -1183,6 +1258,120 @@ def test_worker_environment_allows_read_only_kanban_inspection(
             "utf-8", errors="replace",
         )
         assert b"inspection-import-ok" in proc.stdout
+
+
+def test_worker_environment_rejects_agent_override_before_kanban_show(
+    kanban_home, tmp_path,
+):
+    sentinel = tmp_path / "argv-override-reached"
+    with kb.connect() as conn:
+        worker, _bound = _activate_one_worker(conn, "argv-override")
+        env = dict(os.environ)
+        env.pop("HERMES_KANBAN_LAUNCH_REQUIRED", None)
+        env.update({
+            "HERMES_KANBAN_DB": str(kb._connection_db_path(conn)),
+            "HERMES_KANBAN_TASK": worker,
+        })
+        code = (
+            "import sys; "
+            f"sys.argv = ['hermes', '-z', 'prompt', 'kanban', 'show', "
+            f"{worker!r}, '--json']; "
+            "import hermes_cli.main; "
+            f"open({str(sentinel)!r}, 'w', encoding='utf-8').write('bad')"
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", code],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            timeout=20,
+            check=False,
+        )
+        assert proc.returncode != 0
+        assert not sentinel.exists()
+        assert b"one-use launch capability" in proc.stderr
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["-z", "prompt", "kanban", "show", "{task}", "--json"],
+        ["--oneshot=prompt", "kanban", "show", "{task}", "--json"],
+        [
+            "--provider", "openai-codex", "--model", "gpt-5.6-sol",
+            "-z", "prompt", "kanban", "show", "{task}", "--json",
+        ],
+    ],
+)
+def test_real_main_parser_agent_entry_cannot_masquerade_as_inspection(
+    kanban_home, tmp_path, argv,
+):
+    sentinel = tmp_path / "real-parser-inference-reached"
+    with kb.connect() as conn:
+        worker, _bound = _activate_one_worker(conn, "real-parser-override")
+        env = dict(os.environ)
+        env.pop("HERMES_KANBAN_LAUNCH_REQUIRED", None)
+        env.update({
+            "HERMES_KANBAN_DB": str(kb._connection_db_path(conn)),
+            "HERMES_KANBAN_TASK": worker,
+        })
+        rendered_argv = [worker if item == "{task}" else item for item in argv]
+        code = (
+            "import pathlib, runpy, sys, types; "
+            "fake = types.ModuleType('hermes_cli.oneshot'); "
+            f"fake.run_oneshot = lambda *a, **k: "
+            f"(pathlib.Path({str(sentinel)!r}).write_text('bad'), 0)[1]; "
+            "sys.modules['hermes_cli.oneshot'] = fake; "
+            f"sys.argv = ['hermes', *{rendered_argv!r}]; "
+            "runpy.run_module('hermes_cli.main', run_name='__main__')"
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", code],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            timeout=20,
+            check=False,
+        )
+        assert proc.returncode != 0
+        assert not sentinel.exists()
+        assert b"one-use launch capability" in proc.stderr
+
+
+def test_direct_cli_py_entry_cannot_bypass_worker_admission(
+    kanban_home, tmp_path,
+):
+    sentinel = tmp_path / "direct-cli-entry-reached"
+    repo_root = Path(__file__).resolve().parents[2]
+    with kb.connect() as conn:
+        worker, _bound = _activate_one_worker(conn, "direct-cli-override")
+        env = dict(os.environ)
+        env.pop("HERMES_KANBAN_LAUNCH_REQUIRED", None)
+        env.update({
+            "HERMES_KANBAN_DB": str(kb._connection_db_path(conn)),
+            "HERMES_KANBAN_TASK": worker,
+        })
+        code = (
+            "import pathlib, runpy, sys, types; "
+            "fake = types.ModuleType('fire'); "
+            f"fake.Fire = lambda *a, **k: "
+            f"pathlib.Path({str(sentinel)!r}).write_text('bad'); "
+            "sys.modules['fire'] = fake; "
+            f"sys.argv = ['cli.py', '-q', 'prompt', 'kanban', 'show', "
+            f"{worker!r}, '--json']; "
+            f"runpy.run_path({str(repo_root / 'cli.py')!r}, run_name='__main__')"
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", code],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            timeout=20,
+            check=False,
+        )
+        assert proc.returncode != 0
+        assert not sentinel.exists()
+        assert b"one-use launch capability" in proc.stderr
 
 
 def test_unknown_process_birth_closes_pipe_without_signalling(

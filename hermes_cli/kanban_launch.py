@@ -26,47 +26,54 @@ _CONSUMED: Optional[dict[str, Any]] = None
 _FINISHED = False
 
 
-_READ_ONLY_KANBAN_ACTIONS = {
-    "attachments",
-    "context",
-    "diagnostics",
-    "list",
-    "log",
-    "ls",
-    "runs",
-    "show",
-    "stats",
-    "tail",
-}
-
-
 def _is_read_only_kanban_cli(argv: list[str]) -> bool:
-    """Allow inspection-only descendants without allowing agent startup."""
-    if "chat" in argv:
+    """Accept only the exact non-agent ``kanban show`` CLI grammar."""
+    if not argv or argv[0] != "kanban":
         return False
-    try:
-        index = argv.index("kanban") + 1
-    except ValueError:
-        return False
+    index = 1
     while index < len(argv):
         token = argv[index]
         if token == "--board":
+            if index + 1 >= len(argv) or not argv[index + 1].strip():
+                return False
             index += 2
             continue
-        if token.startswith("--board="):
+        if token.startswith("--board=") and token.split("=", 1)[1].strip():
             index += 1
             continue
         break
-    if index >= len(argv):
+    if index >= len(argv) or argv[index] != "show":
         return False
-    action = argv[index]
-    if action in _READ_ONLY_KANBAN_ACTIONS:
-        return True
-    if action == "boards" and index + 1 < len(argv):
-        return argv[index + 1] in {"list", "ls", "show", "current"}
-    if action == "admission" and index + 1 < len(argv):
-        return argv[index + 1] == "show"
-    return False
+    index += 1
+    if index >= len(argv) or not argv[index].startswith("t_"):
+        return False
+    task_id = argv[index]
+    if not task_id[2:].isalnum():
+        return False
+    index += 1
+    seen_json = False
+    state_type: Optional[str] = None
+    state_name: Optional[str] = None
+    while index < len(argv):
+        token = argv[index]
+        if token == "--json" and not seen_json:
+            seen_json = True
+            index += 1
+            continue
+        if token == "--state-type" and state_type is None:
+            if index + 1 >= len(argv) or argv[index + 1] not in {"status", "outcome"}:
+                return False
+            state_type = argv[index + 1]
+            index += 2
+            continue
+        if token == "--state-name" and state_name is None:
+            if index + 1 >= len(argv) or not argv[index + 1].strip():
+                return False
+            state_name = argv[index + 1]
+            index += 2
+            continue
+        return False
+    return (state_type is None) == (state_name is None)
 
 
 def _required_env(name: str) -> str:

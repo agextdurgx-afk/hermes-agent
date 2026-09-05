@@ -10736,16 +10736,30 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # txn and fired only after every reclaim/accounting txn has committed.
     exited_hook_payloads: list[dict] = []
     # Admitted launches have stronger ownership semantics than legacy tasks.
-    # Revoke their durable process identity under the launch fence before the
-    # ordinary bulk transaction clears any claim/run columns.
+    # Snapshot every nonterminal admitted task before examining liveness so
+    # none can ever fall through to the lossy legacy boolean-PID loop below.
+    # A run/binding mismatch is itself uncertainty and therefore remains held.
+    admitted_task_ids = {
+        str(row["task_id"])
+        for row in conn.execute(
+            "SELECT DISTINCT task_id FROM execution_launches WHERE state IN "
+            "('reserved','spawning','started','revoking')"
+        ).fetchall()
+    }
+    # Revoke a matching admitted launch only after the exact PID + durable
+    # birth-marker observer proves the process dead.  Alive and unknown are
+    # both non-reclaimable here; `_revoke_execution_launch_for_reclaim` repeats
+    # the exact observation under the cross-process launch fence.
     admitted_dead = conn.execute(
         "SELECT id, worker_pid, claim_lock, current_run_id FROM tasks "
         "WHERE status = 'running' AND worker_pid IS NOT NULL"
     ).fetchall()
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
     for candidate in admitted_dead:
+        if candidate["id"] not in admitted_task_ids:
+            continue
         lock = candidate["claim_lock"] or ""
-        if not lock.startswith(host_prefix) or _pid_alive(candidate["worker_pid"]):
+        if not lock.startswith(host_prefix):
             continue
         launch = _execution_launch_row(
             conn,
@@ -10759,11 +10773,21 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
             "reserved", "spawning", "started", "revoking",
         }:
             continue
+        if launch["worker_start_time"] is None:
+            continue
         pid = int(candidate["worker_pid"])
+        observation = _observe_execution_process_identity(
+            pid, int(launch["worker_start_time"]),
+        )
+        if observation["state"] != "dead":
+            continue
         if _revoke_execution_launch_for_reclaim(
             conn,
             launch_id=launch["launch_id"],
-            reason=f"authorized worker pid {pid} exited",
+            reason=(
+                f"authorized worker pid {pid} exited "
+                f"({observation.get('reason', 'exact observer')})"
+            ),
         ):
             crashed.append(candidate["id"])
             _record_task_failure(
@@ -10782,6 +10806,20 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
         ).fetchall()
         host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
         for row in rows:
+            # A durable nonterminal launch is owned exclusively by the exact
+            # admission observer above.  Never let an unknown or failed exact
+            # observation degrade into legacy `_pid_alive` reclamation.
+            # Re-read under this IMMEDIATE transaction as well as consulting
+            # the pre-observation snapshot: an admitted claim may have been
+            # created by another process between those two phases.
+            live_admitted_launch = conn.execute(
+                "SELECT 1 FROM execution_launches WHERE task_id = ? "
+                "AND state IN ('reserved','spawning','started','revoking') "
+                "LIMIT 1",
+                (row["id"],),
+            ).fetchone()
+            if row["id"] in admitted_task_ids or live_admitted_launch is not None:
+                continue
             # Only check liveness for claims owned by this host.
             lock = row["claim_lock"] or ""
             if not lock.startswith(host_prefix):
