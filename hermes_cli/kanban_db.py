@@ -7067,6 +7067,295 @@ class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
 
+class ScheduledNoAgentTransitionError(ValueError):
+    """A parked deterministic card failed its atomic terminal contract."""
+
+
+def terminalize_scheduled_no_agent(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    actor: str,
+    outcome: str,
+    result: Optional[str] = None,
+    summary: Optional[str] = None,
+    metadata: Optional[dict] = None,
+    reason: Optional[str] = None,
+    kind: Optional[str] = None,
+    detach_blocked_parents: bool = False,
+    fire_lifecycle_hook: bool = True,
+) -> bool:
+    """Atomically settle an unclaimed ``deterministic_no_agent_v1`` card.
+
+    The ordinary ``complete`` / ``block`` lifecycle intentionally accepts
+    executable states.  A deterministic conductor must never unpark its card
+    into one of those states merely to reach a terminal state: a dispatcher
+    can claim it in that gap.  This narrow path performs the complete
+    ``scheduled -> done|blocked`` transition, synthetic evidence-run insert,
+    and terminal event in one write transaction.
+
+    The caller must be the exact creator *and* assignee.  The task must have
+    been born scheduled, carry the reviewed no-agent marker, have an absolute
+    one-attempt cap, and have no run, claim, worker, start, comment, or
+    non-creation event history.  These are runtime invariants rather than a
+    prompt convention, so a worker-backed or replay-drifted card cannot use
+    this escape hatch.
+    """
+    actor = str(actor or "").strip()
+    if not actor or actor == "user":
+        raise ScheduledNoAgentTransitionError(
+            "scheduled no-agent terminalization requires an explicit profile actor"
+        )
+    if outcome not in {"completed", "blocked"}:
+        raise ScheduledNoAgentTransitionError(
+            "scheduled no-agent outcome must be completed or blocked"
+        )
+    if metadata is not None and not isinstance(metadata, dict):
+        raise ScheduledNoAgentTransitionError("metadata must be a dict")
+    if outcome == "blocked":
+        if kind not in {None, "needs_input", "capability", "transient"}:
+            raise ScheduledNoAgentTransitionError(
+                "scheduled no-agent block kind must be terminal, not dependency"
+            )
+    elif kind is not None or reason is not None:
+        raise ScheduledNoAgentTransitionError(
+            "completed scheduled no-agent transitions cannot carry block fields"
+        )
+
+    now = int(time.time())
+    terminal_status = "done" if outcome == "completed" else "blocked"
+    handoff_summary = summary if summary is not None else (
+        result if outcome == "completed" else reason
+    )
+    provenance = dict(metadata or {})
+    protected = {
+        "execution": "deterministic_no_agent_v1",
+        "source_status": "scheduled",
+        "terminalized_by": actor,
+        "worker_launched": False,
+    }
+    for key, value in protected.items():
+        if key in provenance and provenance[key] != value:
+            raise ScheduledNoAgentTransitionError(
+                f"metadata field {key} conflicts with no-agent provenance"
+            )
+        provenance[key] = value
+
+    with write_txn(conn):
+        row = conn.execute(
+            """
+            SELECT id, body, assignee, created_by, status, max_attempts,
+                   current_run_id, claim_lock, claim_expires, worker_pid,
+                   started_at, completed_at
+              FROM tasks
+             WHERE id = ?
+            """,
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        if row["status"] != "scheduled":
+            return False
+        if row["assignee"] != actor or row["created_by"] != actor:
+            raise ScheduledNoAgentTransitionError(
+                "scheduled no-agent actor must exactly match creator and assignee"
+            )
+        marker_lines = {
+            line.strip() for line in str(row["body"] or "").splitlines()
+        }
+        if "Execution: deterministic_no_agent_v1" not in marker_lines:
+            raise ScheduledNoAgentTransitionError(
+                "scheduled card lacks the exact deterministic no-agent marker"
+            )
+        if row["max_attempts"] != 1:
+            raise ScheduledNoAgentTransitionError(
+                "scheduled no-agent card must have max_attempts=1"
+            )
+        if any(
+            row[name] is not None
+            for name in (
+                "current_run_id", "claim_lock", "claim_expires", "worker_pid",
+                "started_at", "completed_at",
+            )
+        ):
+            raise ScheduledNoAgentTransitionError(
+                "scheduled no-agent card carries claim, worker, or lifecycle state"
+            )
+        if conn.execute(
+            "SELECT 1 FROM task_runs WHERE task_id = ? LIMIT 1", (task_id,),
+        ).fetchone() is not None:
+            raise ScheduledNoAgentTransitionError(
+                "scheduled no-agent card already has attempt history"
+            )
+        if conn.execute(
+            "SELECT 1 FROM task_comments WHERE task_id = ? LIMIT 1", (task_id,),
+        ).fetchone() is not None:
+            raise ScheduledNoAgentTransitionError(
+                "scheduled no-agent card has unexpected comment history"
+            )
+        events = conn.execute(
+            "SELECT kind, payload FROM task_events WHERE task_id = ? ORDER BY id",
+            (task_id,),
+        ).fetchall()
+        if len(events) != 1 or events[0]["kind"] != "created":
+            raise ScheduledNoAgentTransitionError(
+                "scheduled no-agent card must have only its atomic creation event"
+            )
+        try:
+            created_payload = json.loads(events[0]["payload"] or "null")
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ScheduledNoAgentTransitionError(
+                "scheduled no-agent creation event is malformed"
+            ) from exc
+        if not isinstance(created_payload, dict) or created_payload.get("status") != "scheduled":
+            raise ScheduledNoAgentTransitionError(
+                "scheduled no-agent card was not born atomically scheduled"
+            )
+        if created_payload.get("assignee") != actor:
+            raise ScheduledNoAgentTransitionError(
+                "scheduled no-agent creation assignee does not match actor"
+            )
+        linked_parent_rows = conn.execute(
+            """
+            SELECT p.id AS parent_id, p.status AS parent_status
+              FROM task_links l
+              JOIN tasks p ON p.id = l.parent_id
+             WHERE l.child_id = ?
+             ORDER BY p.id
+            """,
+            (task_id,),
+        ).fetchall()
+        linked_parents = [
+            value["parent_id"]
+            for value in linked_parent_rows
+        ]
+        missing_link_parents = conn.execute(
+            """
+            SELECT l.parent_id
+              FROM task_links l
+              LEFT JOIN tasks p ON p.id = l.parent_id
+             WHERE l.child_id = ? AND p.id IS NULL
+            """,
+            (task_id,),
+        ).fetchall()
+        if missing_link_parents:
+            raise ScheduledNoAgentTransitionError(
+                "scheduled no-agent parent graph contains a missing task"
+            )
+        created_parents = sorted(created_payload.get("parents") or [])
+        if created_parents != linked_parents:
+            raise ScheduledNoAgentTransitionError(
+                "scheduled no-agent parent graph drifted after atomic creation"
+            )
+        detached = []
+        if detach_blocked_parents:
+            invalid = [
+                value["parent_id"]
+                for value in linked_parent_rows
+                if value["parent_status"] not in {"done", "archived", "blocked"}
+            ]
+            if invalid:
+                raise ScheduledNoAgentTransitionError(
+                    "scheduled no-agent detach found a nonterminal, nonblocked parent"
+                )
+            detached = [
+                value["parent_id"]
+                for value in linked_parent_rows
+                if value["parent_status"] == "blocked"
+            ]
+            for parent_id in detached:
+                conn.execute(
+                    "DELETE FROM task_links WHERE parent_id = ? AND child_id = ?",
+                    (parent_id, task_id),
+                )
+        if detached:
+            provenance["detached_blocked_parent_ids"] = detached
+        if not _parents_satisfied(conn, task_id):
+            return False
+
+        cur = conn.execute(
+            """
+            UPDATE tasks
+               SET status = ?, result = ?, completed_at = ?,
+                   block_kind = ?, block_recurrences = 0
+             WHERE id = ? AND status = 'scheduled'
+               AND current_run_id IS NULL AND claim_lock IS NULL
+               AND worker_pid IS NULL AND started_at IS NULL
+            """,
+            (
+                terminal_status,
+                result if outcome == "completed" else None,
+                now if outcome == "completed" else None,
+                kind if outcome == "blocked" else None,
+                task_id,
+            ),
+        )
+        if cur.rowcount != 1:
+            return False
+        run_id = _synthesize_ended_run(
+            conn,
+            task_id,
+            outcome=outcome,
+            summary=handoff_summary,
+            error=reason if outcome == "blocked" else None,
+            metadata=provenance,
+        )
+        if outcome == "completed":
+            _append_event(
+                conn,
+                task_id,
+                "completed",
+                {
+                    "result_len": len(result) if result else 0,
+                    "summary": (
+                        handoff_summary.strip().splitlines()[0][:400]
+                        if handoff_summary and handoff_summary.strip()
+                        else None
+                    ),
+                    "source_status": "scheduled",
+                    "deterministic_no_agent": True,
+                },
+                run_id=run_id,
+            )
+        else:
+            _append_event(
+                conn,
+                task_id,
+                "blocked",
+                {
+                    "reason": reason,
+                    "kind": kind,
+                    "recurrences": 0,
+                    "source_status": "scheduled",
+                    "deterministic_no_agent": True,
+                },
+                run_id=run_id,
+            )
+
+    if outcome == "completed":
+        recompute_ready(conn)
+        _clear_failure_counter(conn, task_id)
+        if fire_lifecycle_hook:
+            _fire_kanban_lifecycle_hook(
+                "kanban_task_completed",
+                task_id,
+                board=get_current_board(),
+                assignee=actor,
+                run_id=run_id,
+                summary=handoff_summary,
+            )
+    elif fire_lifecycle_hook:
+        _fire_kanban_lifecycle_hook(
+            "kanban_task_blocked",
+            task_id,
+            board=get_current_board(),
+            assignee=actor,
+            run_id=run_id,
+            reason=reason,
+        )
+    return True
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,

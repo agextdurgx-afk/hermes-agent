@@ -655,6 +655,20 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_complete.add_argument("--metadata", default=None,
                             help='JSON dict of structured facts (e.g. \'{"changed_files": [...], '
                                  '"tests_run": 12}\'). Stored on the closing run.')
+    p_complete.add_argument(
+        "--from-scheduled-no-agent", action="store_true",
+        help=(
+            "Atomically complete an unclaimed deterministic_no_agent_v1 card "
+            "directly from scheduled. Restricted to its exact creator/assignee profile."
+        ),
+    )
+    p_complete.add_argument(
+        "--detach-blocked-parents", action="store_true",
+        help=(
+            "With --from-scheduled-no-agent, atomically detach only currently "
+            "blocked parents before the terminal transition."
+        ),
+    )
 
     p_edit = sub.add_parser(
         "edit",
@@ -690,6 +704,17 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
             "blocked for a human; 'transient' marks a maybe-flaky failure. "
             "Repeated same-kind re-blocks after unblock route the task to "
             "triage to break unblock loops. Omit for a generic block."
+        ),
+    )
+    p_block.add_argument(
+        "--metadata", default=None,
+        help="JSON dict of terminal provenance for --from-scheduled-no-agent.",
+    )
+    p_block.add_argument(
+        "--from-scheduled-no-agent", action="store_true",
+        help=(
+            "Atomically block an unclaimed deterministic_no_agent_v1 card "
+            "directly from scheduled. Restricted to its exact creator/assignee profile."
         ),
     )
 
@@ -2662,6 +2687,14 @@ def _cmd_complete(args: argparse.Namespace) -> int:
     if not ids:
         print("at least one task_id is required", file=sys.stderr)
         return 1
+    if getattr(args, "detach_blocked_parents", False) and not getattr(
+        args, "from_scheduled_no_agent", False
+    ):
+        print(
+            "kanban: --detach-blocked-parents requires --from-scheduled-no-agent",
+            file=sys.stderr,
+        )
+        return 2
     summary = getattr(args, "summary", None)
     raw_meta = getattr(args, "metadata", None)
     # Guard: structured handoff fields are per-run, so they'd be
@@ -2687,6 +2720,40 @@ def _cmd_complete(args: argparse.Namespace) -> int:
     failed: list[str] = []
     with kb.connect_closing() as conn:
         for tid in ids:
+            if getattr(args, "from_scheduled_no_agent", False):
+                if len(ids) != 1:
+                    print(
+                        "kanban: --from-scheduled-no-agent accepts exactly one task",
+                        file=sys.stderr,
+                    )
+                    return 2
+                if os.environ.get("HERMES_KANBAN_TASK"):
+                    print(
+                        "kanban: an admitted worker cannot terminalize a scheduled no-agent card",
+                        file=sys.stderr,
+                    )
+                    return 1
+                if not kb.terminalize_scheduled_no_agent(
+                    conn,
+                    tid,
+                    actor=_profile_author(),
+                    outcome="completed",
+                    result=args.result,
+                    summary=summary,
+                    metadata=metadata,
+                    detach_blocked_parents=bool(
+                        getattr(args, "detach_blocked_parents", False)
+                    ),
+                ):
+                    failed.append(tid)
+                    print(
+                        f"cannot atomically complete {tid} from scheduled "
+                        "(unknown id, parents open, or state changed)",
+                        file=sys.stderr,
+                    )
+                else:
+                    print(f"Completed {tid} atomically from scheduled (no agent)")
+                continue
             # Goal-mode judge gate (mirrors tools/kanban_tools.py). Apply it
             # to every terminal handoff so request-review cannot bypass the
             # acceptance contract that protects complete.
@@ -2761,9 +2828,50 @@ def _cmd_block(args: argparse.Namespace) -> int:
     kind = getattr(args, "kind", None)
     author = _profile_author()
     ids = [args.task_id] + list(getattr(args, "ids", None) or [])
+    metadata = None
+    raw_meta = getattr(args, "metadata", None)
+    if raw_meta:
+        try:
+            metadata = json.loads(raw_meta)
+            if not isinstance(metadata, dict):
+                raise ValueError("must be a JSON object")
+        except (ValueError, json.JSONDecodeError) as exc:
+            print(f"kanban: --metadata: {exc}", file=sys.stderr)
+            return 2
     failed: list[str] = []
     with kb.connect_closing() as conn:
         for tid in ids:
+            if getattr(args, "from_scheduled_no_agent", False):
+                if len(ids) != 1:
+                    print(
+                        "kanban: --from-scheduled-no-agent accepts exactly one task",
+                        file=sys.stderr,
+                    )
+                    return 2
+                if os.environ.get("HERMES_KANBAN_TASK"):
+                    print(
+                        "kanban: an admitted worker cannot terminalize a scheduled no-agent card",
+                        file=sys.stderr,
+                    )
+                    return 1
+                if not kb.terminalize_scheduled_no_agent(
+                    conn,
+                    tid,
+                    actor=author,
+                    outcome="blocked",
+                    reason=reason,
+                    kind=kind,
+                    metadata=metadata,
+                ):
+                    failed.append(tid)
+                    print(
+                        f"cannot atomically block {tid} from scheduled "
+                        "(unknown id, parents open, or state changed)",
+                        file=sys.stderr,
+                    )
+                else:
+                    print(f"Blocked {tid} atomically from scheduled (no agent)")
+                continue
             if reason:
                 kb.add_comment(conn, tid, author, f"BLOCKED: {reason}")
             if not kb.block_task(

@@ -70,6 +70,76 @@ def test_kanban_show_text_renders_graph_with_open_connection(kanban_home):
     assert "Cannot operate on a closed database" not in output
 
 
+def test_cli_atomically_completes_a_scheduled_no_agent_card(kanban_home, monkeypatch):
+    monkeypatch.setenv("HERMES_PROFILE", "coordinator")
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    with kb.connect_closing() as conn:
+        parent_id = kb.create_task(
+            conn,
+            title="terminal parent",
+            assignee="coordinator",
+            created_by="coordinator",
+        )
+        assert kb.complete_task(
+            conn, parent_id, result="success", fire_lifecycle_hook=False,
+        )
+        task_id = kb.create_task(
+            conn,
+            title="deterministic card",
+            body="Execution: deterministic_no_agent_v1",
+            assignee="coordinator",
+            created_by="coordinator",
+            parents=[parent_id],
+            initial_status="scheduled",
+            max_attempts=1,
+        )
+
+    output = kc.run_slash(
+        f"complete {task_id} --from-scheduled-no-agent --result success "
+        "--metadata '{\"artifact\":\"proof.json\"}'"
+    )
+
+    assert "atomically from scheduled" in output
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, task_id)
+        runs = conn.execute(
+            "SELECT metadata FROM task_runs WHERE task_id=? ORDER BY id",
+            (task_id,),
+        ).fetchall()
+    assert task is not None and task.status == "done"
+    assert len(runs) == 1
+    assert json.loads(runs[0]["metadata"])["worker_launched"] is False
+
+
+def test_cli_rejects_no_agent_terminalization_from_an_admitted_worker(
+    kanban_home, monkeypatch,
+):
+    monkeypatch.setenv("HERMES_PROFILE", "coordinator")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_active_worker")
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="deterministic card",
+            body="Execution: deterministic_no_agent_v1",
+            assignee="coordinator",
+            created_by="coordinator",
+            initial_status="scheduled",
+            max_attempts=1,
+        )
+
+    output = kc.run_slash(
+        f"complete {task_id} --from-scheduled-no-agent --result success"
+    )
+    assert "admitted worker cannot terminalize" in output
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, task_id)
+        runs = conn.execute(
+            "SELECT id FROM task_runs WHERE task_id=?", (task_id,),
+        ).fetchall()
+    assert task is not None and task.status == "scheduled"
+    assert runs == []
+
+
 def test_board_override_is_isolated_per_concurrent_call(kanban_home, monkeypatch):
     kb.create_board("alpha")
     kb.create_board("beta")
@@ -177,5 +247,3 @@ def test_run_slash_reclaim_running_task(kanban_home):
 # ---------------------------------------------------------------------------
 # /kanban help / no-args / unknown-action UX (issue #21794)
 # ---------------------------------------------------------------------------
-
-

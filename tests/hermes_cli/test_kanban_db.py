@@ -226,6 +226,246 @@ def test_initial_scheduled_task_is_atomic_and_schedule_replay_is_idempotent(
         ]
 
 
+def _scheduled_no_agent_task(conn, *, parent=None, actor="coordinator"):
+    parents = [parent] if parent else []
+    return kb.create_task(
+        conn,
+        title="deterministic checkpoint",
+        body="Type: fixture gate\nExecution: deterministic_no_agent_v1",
+        assignee=actor,
+        created_by=actor,
+        parents=parents,
+        initial_status="scheduled",
+        max_attempts=1,
+    )
+
+
+def test_scheduled_no_agent_terminalization_is_atomic_and_provenanced(kanban_home):
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent", assignee="worker")
+        assert kb.complete_task(conn, parent, result="done")
+        task_id = _scheduled_no_agent_task(conn, parent=parent)
+        child = kb.create_task(
+            conn, title="child", assignee="worker", parents=[task_id],
+        )
+
+        assert kb.terminalize_scheduled_no_agent(
+            conn,
+            task_id,
+            actor="coordinator",
+            outcome="completed",
+            result="success",
+            summary="checkpoint passed",
+            metadata={"artifact": "proof.json", "sha256": "a" * 64},
+            fire_lifecycle_hook=False,
+        )
+        task = kb.get_task(conn, task_id)
+        assert task.status == "done"
+        assert task.result == "success"
+        assert kb.get_task(conn, child).status == "ready"
+        runs = kb.list_runs(conn, task_id)
+        assert len(runs) == 1
+        run = runs[0]
+        assert run.status == "completed"
+        assert run.outcome == "completed"
+        assert run.claim_lock is None
+        assert run.worker_pid is None
+        assert run.started_at == run.ended_at
+        assert run.metadata == {
+            "artifact": "proof.json",
+            "sha256": "a" * 64,
+            "execution": "deterministic_no_agent_v1",
+            "source_status": "scheduled",
+            "terminalized_by": "coordinator",
+            "worker_launched": False,
+        }
+        events = kb.list_events(conn, task_id)
+        assert [event.kind for event in events] == ["created", "completed"]
+        assert events[-1].payload["deterministic_no_agent"] is True
+        assert kb.claim_task(conn, task_id, claimer="must-not-claim") is None
+
+
+def test_scheduled_no_agent_failure_blocks_atomically_without_exposing_child(
+    kanban_home,
+):
+    with kb.connect() as conn:
+        task_id = _scheduled_no_agent_task(conn)
+        child = kb.create_task(
+            conn, title="child", assignee="worker", parents=[task_id],
+        )
+        assert kb.terminalize_scheduled_no_agent(
+            conn,
+            task_id,
+            actor="coordinator",
+            outcome="blocked",
+            reason="validator failed",
+            kind="needs_input",
+            metadata={"failure": "validator failed"},
+            fire_lifecycle_hook=False,
+        )
+        task = kb.get_task(conn, task_id)
+        assert task.status == "blocked"
+        assert task.block_kind == "needs_input"
+        assert kb.get_task(conn, child).status == "todo"
+        runs = kb.list_runs(conn, task_id)
+        assert len(runs) == 1
+        assert runs[0].outcome == "blocked"
+        assert runs[0].worker_pid is None
+        assert runs[0].metadata["worker_launched"] is False
+        events = kb.list_events(conn, task_id)
+        assert [event.kind for event in events] == ["created", "blocked"]
+        assert events[-1].payload["source_status"] == "scheduled"
+
+
+def test_scheduled_no_agent_can_atomically_detach_only_blocked_parents(
+    kanban_home,
+):
+    with kb.connect() as conn:
+        done_parent = kb.create_task(conn, title="done", assignee="worker")
+        blocked_parent = kb.create_task(conn, title="blocked", assignee="worker")
+        assert kb.complete_task(conn, done_parent, result="done")
+        assert kb.block_task(
+            conn, blocked_parent, reason="external", kind="needs_input",
+        )
+        task_id = kb.create_task(
+            conn,
+            title="deterministic registration",
+            body="Execution: deterministic_no_agent_v1",
+            assignee="coordinator",
+            created_by="coordinator",
+            parents=[done_parent, blocked_parent],
+            initial_status="scheduled",
+            max_attempts=1,
+        )
+        assert kb.terminalize_scheduled_no_agent(
+            conn,
+            task_id,
+            actor="coordinator",
+            outcome="completed",
+            metadata={"gate_count": 2},
+            detach_blocked_parents=True,
+            fire_lifecycle_hook=False,
+        )
+        assert kb.get_task(conn, task_id).status == "done"
+        parents = conn.execute(
+            "SELECT parent_id FROM task_links WHERE child_id = ? ORDER BY parent_id",
+            (task_id,),
+        ).fetchall()
+        assert [row["parent_id"] for row in parents] == [done_parent]
+        assert kb.list_runs(conn, task_id)[0].metadata[
+            "detached_blocked_parent_ids"
+        ] == [blocked_parent]
+
+
+def test_scheduled_no_agent_terminalization_rejects_identity_and_history_drift(
+    kanban_home,
+):
+    with kb.connect() as conn:
+        wrong_actor = _scheduled_no_agent_task(conn)
+        with pytest.raises(
+            kb.ScheduledNoAgentTransitionError,
+            match="creator and assignee",
+        ):
+            kb.terminalize_scheduled_no_agent(
+                conn,
+                wrong_actor,
+                actor="other",
+                outcome="completed",
+                fire_lifecycle_hook=False,
+            )
+        assert kb.get_task(conn, wrong_actor).status == "scheduled"
+
+        history = _scheduled_no_agent_task(conn)
+        kb.add_comment(conn, history, "coordinator", "unexpected pre-terminal note")
+        with pytest.raises(
+            kb.ScheduledNoAgentTransitionError,
+            match="comment history",
+        ):
+            kb.terminalize_scheduled_no_agent(
+                conn,
+                history,
+                actor="coordinator",
+                outcome="completed",
+                fire_lifecycle_hook=False,
+            )
+        assert kb.get_task(conn, history).status == "scheduled"
+
+
+def test_scheduled_no_agent_terminalization_rolls_back_every_transition_on_crash(
+    kanban_home,
+):
+    with kb.connect() as conn:
+        task_id = _scheduled_no_agent_task(conn)
+        conn.execute(
+            """
+            CREATE TRIGGER abort_no_agent_run
+            BEFORE INSERT ON task_runs
+            BEGIN
+              SELECT RAISE(ABORT, 'injected terminal crash');
+            END
+            """
+        )
+        conn.commit()
+        with pytest.raises(sqlite3.IntegrityError, match="injected terminal crash"):
+            kb.terminalize_scheduled_no_agent(
+                conn,
+                task_id,
+                actor="coordinator",
+                outcome="completed",
+                metadata={"artifact": "proof.json"},
+                fire_lifecycle_hook=False,
+            )
+        assert kb.get_task(conn, task_id).status == "scheduled"
+        assert kb.list_runs(conn, task_id) == []
+        assert [event.kind for event in kb.list_events(conn, task_id)] == ["created"]
+
+        conn.execute("DROP TRIGGER abort_no_agent_run")
+        conn.commit()
+        assert kb.terminalize_scheduled_no_agent(
+            conn,
+            task_id,
+            actor="coordinator",
+            outcome="completed",
+            metadata={"artifact": "proof.json"},
+            fire_lifecycle_hook=False,
+        )
+
+
+def test_scheduled_no_agent_terminalization_cannot_race_a_dispatch_claim(
+    kanban_home,
+):
+    with kb.connect() as conn:
+        task_id = _scheduled_no_agent_task(conn)
+
+    def claim():
+        with kb.connect() as conn:
+            return kb.claim_task(conn, task_id, claimer="racing-dispatcher")
+
+    def terminalize():
+        with kb.connect() as conn:
+            return kb.terminalize_scheduled_no_agent(
+                conn,
+                task_id,
+                actor="coordinator",
+                outcome="completed",
+                metadata={"artifact": "proof.json"},
+                fire_lifecycle_hook=False,
+            )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        claimed, completed = [
+            future.result(timeout=5)
+            for future in (pool.submit(claim), pool.submit(terminalize))
+        ]
+    assert claimed is None
+    assert completed is True
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        assert task.status == "done"
+        assert len(kb.list_runs(conn, task_id)) == 1
+        assert kb.list_runs(conn, task_id)[0].worker_pid is None
+
+
 def test_absolute_attempt_limit_survives_reclaim_and_explicit_unblock(
     kanban_home, monkeypatch,
 ):
