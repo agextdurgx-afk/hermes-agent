@@ -5707,6 +5707,31 @@ def close_execution_admission(
                     "cannot close while execution launch is "
                     f"{live_launch['state']}: {live_launch['launch_id']}"
                 )
+            bound_ids = [
+                row["task_id"]
+                for row in conn.execute(
+                    "SELECT task_id FROM execution_admission_tasks "
+                    "WHERE authorization_id = ? ORDER BY task_id",
+                    (authorization_id,),
+                ).fetchall()
+            ]
+            if not bound_ids:
+                raise ExecutionAdmissionError(
+                    "cannot close an execution admission without bound tasks"
+                )
+            placeholders = ",".join("?" for _ in bound_ids)
+            foreign = conn.execute(
+                "SELECT id, status FROM tasks "
+                "WHERE status IN ('triage','ready','running','review') "
+                "AND id NOT IN (" + placeholders + ") "
+                "ORDER BY id LIMIT 1",
+                tuple(bound_ids),
+            ).fetchone()
+            if foreign is not None:
+                raise ExecutionAdmissionError(
+                    "cannot close while foreign work is executable: "
+                    f"{foreign['id']} ({foreign['status']})"
+                )
             conn.execute(
                 "UPDATE execution_admissions "
                 "SET state = 'closed', live_slot = NULL, closed_at = ? "

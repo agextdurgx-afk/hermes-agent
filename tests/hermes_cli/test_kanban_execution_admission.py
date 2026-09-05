@@ -466,6 +466,110 @@ def test_seal_denies_all_and_close_preserves_tombstone(kanban_home):
         assert kb.claim_task(conn, worker, claimer="test:closed") is not None
 
 
+@pytest.mark.parametrize("foreign_status", ["triage", "ready", "running", "review"])
+def test_close_rejects_foreign_executable_work_in_the_close_transaction(
+    kanban_home, foreign_status
+):
+    with kb.connect() as conn:
+        _begin(conn)
+        worker = _task(conn, "collector")
+        bound = _bind(conn, [{
+            "task_id": worker,
+            "execution_kind": "worker",
+            "allowed_claim_status": "ready",
+        }])
+        _activate(conn, bound["policy_sha256"])
+        sealed = kb.seal_execution_admission(
+            conn,
+            authorization_id=AUTH,
+            generation=GENERATION,
+            policy_sha256=bound["policy_sha256"],
+            reason="replay terminal evidence persisted",
+        )
+        foreign = kb.create_task(
+            conn,
+            title=f"foreign-{foreign_status}",
+            assignee="foreign-worker",
+            initial_status="scheduled",
+        )
+        conn.execute(
+            "UPDATE tasks SET status = ? WHERE id = ?",
+            (foreign_status, foreign),
+        )
+        with pytest.raises(
+            kb.ExecutionAdmissionError,
+            match="cannot close while foreign work is executable",
+        ):
+            kb.close_execution_admission(
+                conn,
+                authorization_id=AUTH,
+                generation=GENERATION,
+                policy_sha256=sealed["policy_sha256"],
+            )
+        status = kb.execution_admission_status(conn, AUTH)
+        assert status["state"] == "sealed"
+        assert status["live"] is True
+
+
+def test_close_waits_for_competing_writer_then_observes_its_foreign_ready_task(
+    kanban_home,
+):
+    with kb.connect() as setup:
+        _begin(setup)
+        worker = _task(setup, "collector")
+        bound = _bind(setup, [{
+            "task_id": worker,
+            "execution_kind": "worker",
+            "allowed_claim_status": "ready",
+        }])
+        _activate(setup, bound["policy_sha256"])
+        sealed = kb.seal_execution_admission(
+            setup,
+            authorization_id=AUTH,
+            generation=GENERATION,
+            policy_sha256=bound["policy_sha256"],
+            reason="replay terminal evidence persisted",
+        )
+        foreign = kb.create_task(
+            setup,
+            title="foreign-racing-ready",
+            assignee="foreign-worker",
+            initial_status="scheduled",
+        )
+
+    writer = kb.connect()
+    writer.execute("BEGIN IMMEDIATE")
+    writer.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (foreign,))
+    observed: list[BaseException | dict] = []
+
+    def close_after_writer() -> None:
+        try:
+            with kb.connect() as contender:
+                observed.append(kb.close_execution_admission(
+                    contender,
+                    authorization_id=AUTH,
+                    generation=GENERATION,
+                    policy_sha256=sealed["policy_sha256"],
+                ))
+        except BaseException as exc:  # captured for assertion in test thread
+            observed.append(exc)
+
+    thread = threading.Thread(target=close_after_writer)
+    thread.start()
+    time.sleep(0.03)
+    writer.execute("COMMIT")
+    writer.close()
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+    assert len(observed) == 1
+    assert isinstance(observed[0], kb.ExecutionAdmissionError)
+    assert "cannot close while foreign work is executable" in str(observed[0])
+    with kb.connect() as check:
+        status = kb.execution_admission_status(check, AUTH)
+        assert status["state"] == "sealed"
+        assert status["live"] is True
+
+
 def test_execution_admission_is_scoped_to_one_board_database(tmp_path):
     first_path = tmp_path / "first.db"
     second_path = tmp_path / "second.db"
