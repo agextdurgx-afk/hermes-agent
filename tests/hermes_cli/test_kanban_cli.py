@@ -140,6 +140,47 @@ def test_cli_rejects_no_agent_terminalization_from_an_admitted_worker(
     assert runs == []
 
 
+def test_cli_atomically_blocks_a_scheduled_no_agent_card_behind_blocked_parent(
+    kanban_home, monkeypatch,
+):
+    monkeypatch.setenv("HERMES_PROFILE", "coordinator")
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    with kb.connect_closing() as conn:
+        parent_id = kb.create_task(conn, title="blocked parent", assignee="worker")
+        assert kb.block_task(
+            conn, parent_id, reason="source unavailable", kind="needs_input",
+        )
+        task_id = kb.create_task(
+            conn,
+            title="deterministic failing gate",
+            body="Execution: deterministic_no_agent_v1",
+            assignee="coordinator",
+            created_by="coordinator",
+            parents=[parent_id],
+            initial_status="scheduled",
+            max_attempts=1,
+        )
+        child_id = kb.create_task(
+            conn, title="downstream child", assignee="worker", parents=[task_id],
+        )
+
+    output = kc.run_slash(
+        f"block --kind needs_input {task_id} deterministic validator failed "
+        "--from-scheduled-no-agent"
+    )
+
+    assert "atomically from scheduled" in output
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, task_id)
+        child = kb.get_task(conn, child_id)
+        parents = conn.execute(
+            "SELECT parent_id FROM task_links WHERE child_id=?", (task_id,),
+        ).fetchall()
+    assert task is not None and task.status == "blocked"
+    assert child is not None and child.status == "todo"
+    assert [row["parent_id"] for row in parents] == [parent_id]
+
+
 def test_board_override_is_isolated_per_concurrent_call(kanban_home, monkeypatch):
     kb.create_board("alpha")
     kb.create_board("beta")

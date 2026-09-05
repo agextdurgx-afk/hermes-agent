@@ -7270,7 +7270,14 @@ def terminalize_scheduled_no_agent(
                 )
         if detached:
             provenance["detached_blocked_parent_ids"] = detached
-        if not _parents_satisfied(conn, task_id):
+        # A deterministic success may expose its child, so every remaining
+        # parent must be satisfied after any reviewed blocked-parent
+        # detachment.  A deterministic failure has the opposite contract: it
+        # must be able to become terminal even when an upstream parent is
+        # blocked, and it never recomputes/promotes descendants.  Requiring
+        # parent success for the failure path leaves the no-agent card parked
+        # forever and loses the promised terminal needs_input evidence.
+        if outcome == "completed" and not _parents_satisfied(conn, task_id):
             return False
 
         cur = conn.execute(

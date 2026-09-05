@@ -317,6 +317,62 @@ def test_scheduled_no_agent_failure_blocks_atomically_without_exposing_child(
         assert events[-1].payload["source_status"] == "scheduled"
 
 
+def test_scheduled_no_agent_failure_terminalizes_behind_blocked_parent_without_detaching(
+    kanban_home,
+):
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="blocked parent", assignee="worker")
+        assert kb.block_task(
+            conn, parent, reason="source unavailable", kind="needs_input",
+        )
+        task_id = _scheduled_no_agent_task(conn, parent=parent)
+        child = kb.create_task(
+            conn, title="child", assignee="worker", parents=[task_id],
+        )
+
+        assert kb.terminalize_scheduled_no_agent(
+            conn,
+            task_id,
+            actor="coordinator",
+            outcome="blocked",
+            reason="deterministic validation failed",
+            kind="needs_input",
+            metadata={"failure": "deterministic validation failed"},
+            fire_lifecycle_hook=False,
+        )
+        assert kb.get_task(conn, task_id).status == "blocked"
+        assert kb.get_task(conn, child).status == "todo"
+        parents = conn.execute(
+            "SELECT parent_id FROM task_links WHERE child_id = ? ORDER BY parent_id",
+            (task_id,),
+        ).fetchall()
+        assert [row["parent_id"] for row in parents] == [parent]
+        runs = kb.list_runs(conn, task_id)
+        assert len(runs) == 1
+        assert runs[0].outcome == "blocked"
+        assert runs[0].metadata["worker_launched"] is False
+
+
+def test_scheduled_no_agent_success_still_refuses_blocked_parent_without_detach(
+    kanban_home,
+):
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="blocked parent", assignee="worker")
+        assert kb.block_task(
+            conn, parent, reason="source unavailable", kind="needs_input",
+        )
+        task_id = _scheduled_no_agent_task(conn, parent=parent)
+        assert kb.terminalize_scheduled_no_agent(
+            conn,
+            task_id,
+            actor="coordinator",
+            outcome="completed",
+            fire_lifecycle_hook=False,
+        ) is False
+        assert kb.get_task(conn, task_id).status == "scheduled"
+        assert kb.list_runs(conn, task_id) == []
+
+
 def test_scheduled_no_agent_can_atomically_detach_only_blocked_parents(
     kanban_home,
 ):
