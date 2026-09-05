@@ -1357,8 +1357,7 @@ def test_direct_cli_py_entry_cannot_bypass_worker_admission(
             f"fake.Fire = lambda *a, **k: "
             f"pathlib.Path({str(sentinel)!r}).write_text('bad'); "
             "sys.modules['fire'] = fake; "
-            f"sys.argv = ['cli.py', '-q', 'prompt', 'kanban', 'show', "
-            f"{worker!r}, '--json']; "
+            f"sys.argv = ['cli.py', 'kanban', 'show', {worker!r}]; "
             f"runpy.run_path({str(repo_root / 'cli.py')!r}, run_name='__main__')"
         )
         proc = subprocess.run(
