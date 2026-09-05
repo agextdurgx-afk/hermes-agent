@@ -1146,6 +1146,13 @@ class Task:
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
+    # Ephemeral startup capability attached only to a freshly claimed task.
+    # The nonce is never stored in plaintext and is never reconstructed by
+    # ``from_row``; losing this in-memory value makes the launch unusable.
+    execution_launch_id: Optional[str] = None
+    execution_launch_nonce: Optional[str] = field(default=None, repr=False)
+    execution_launch_db_path: Optional[str] = None
+    execution_launch_lane: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1244,6 +1251,15 @@ class Task:
                 else 0
             ),
         )
+
+
+@dataclass
+class SpawnedWorker:
+    """A launched process plus its still-private startup authorization pipe."""
+
+    pid: int
+    startup_writer: Any = field(default=None, repr=False)
+    process: Any = field(default=None, repr=False)
 
 
 @dataclass
@@ -1529,6 +1545,44 @@ CREATE TABLE IF NOT EXISTS execution_admission_tasks (
             allowed_claim_status IS NOT NULL))
 );
 
+-- One-use startup authorization for every inference worker launched beneath
+-- an execution admission.  The admission decides *which* task may be claimed;
+-- this ledger closes the later claim -> workspace -> spawn race by binding the
+-- exact process launch to that claim and requiring the child to consume a
+-- random nonce before any agent/plugin/tool startup.
+CREATE TABLE IF NOT EXISTS execution_launches (
+    launch_id          TEXT PRIMARY KEY,
+    authorization_id   TEXT NOT NULL,
+    task_id            TEXT NOT NULL,
+    run_id             INTEGER NOT NULL,
+    claim_lock         TEXT NOT NULL,
+    claim_lane         TEXT NOT NULL,
+    generation         INTEGER NOT NULL,
+    policy_sha256      TEXT NOT NULL,
+    board_db_path      TEXT NOT NULL,
+    board_sha256       TEXT NOT NULL,
+    identity_sha256    TEXT NOT NULL,
+    nonce_sha256       TEXT NOT NULL,
+    state              TEXT NOT NULL,
+    dispatcher_pid     INTEGER NOT NULL,
+    worker_pid         INTEGER,
+    worker_start_time  INTEGER,
+    created_at         INTEGER NOT NULL,
+    spawning_at        INTEGER,
+    pid_registered_at  INTEGER,
+    started_at         INTEGER,
+    exit_requested_at  INTEGER,
+    exited_at          INTEGER,
+    revoked_at         INTEGER,
+    failure_reason     TEXT,
+    UNIQUE (task_id, run_id),
+    CHECK (claim_lane IN ('ready', 'review')),
+    CHECK (state IN (
+        'reserved', 'spawning', 'started', 'exited',
+        'revoking', 'revoked', 'failed'
+    ))
+);
+
 -- Files attached to a task (PDFs, images, source documents). The blob
 -- lives on disk under ``attachments_root(board)/<task_id>/<stored_name>``;
 -- this row carries metadata + the absolute ``stored_path`` so the
@@ -1578,6 +1632,10 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_execution_admission_live
     ON execution_admissions(live_slot) WHERE live_slot IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_execution_admission_task
     ON execution_admission_tasks(task_id, authorization_id);
+CREATE INDEX IF NOT EXISTS idx_execution_launch_task
+    ON execution_launches(task_id, run_id, state);
+CREATE INDEX IF NOT EXISTS idx_execution_launch_admission
+    ON execution_launches(authorization_id, state);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
 """
@@ -1661,6 +1719,80 @@ def _sqlite_connect(path: Path) -> sqlite3.Connection:
             pass
         raise
     return conn
+
+
+def _connection_db_path(conn: sqlite3.Connection) -> Path:
+    """Return the canonical on-disk path backing ``conn``'s main database.
+
+    Safety-sensitive execution fencing must follow the connection actually in
+    use, never a caller-supplied board label or ambient current-board setting.
+    In-memory/anonymous databases cannot provide a cross-process identity and
+    are therefore rejected for admitted execution.
+    """
+    for row in conn.execute("PRAGMA database_list").fetchall():
+        # sqlite3.Row supports both names and positions; use positions so this
+        # helper remains correct for callers that replaced row_factory.
+        name = row[1]
+        raw_path = row[2]
+        if name == "main":
+            if not raw_path:
+                raise ExecutionAdmissionError(
+                    "execution admission requires an on-disk board database"
+                )
+            return Path(str(raw_path)).expanduser().resolve()
+    raise ExecutionAdmissionError("board database identity is unavailable")
+
+
+@contextlib.contextmanager
+def _execution_launch_fence(conn: sqlite3.Connection, *, timeout: float = 10.0):
+    """Hold the durable board-scoped fence for launch/revoke/seal operations."""
+    db_path = _connection_db_path(conn)
+    lock_path = db_path.with_name(db_path.name + ".execution.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = lock_path.open("a+b")
+    acquired = False
+    try:
+        deadline = time.monotonic() + max(float(timeout), 0.1)
+        if _IS_WINDOWS:
+            import msvcrt
+
+            while time.monotonic() < deadline:
+                try:
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                    acquired = True
+                    break
+                except OSError:
+                    time.sleep(0.02)
+        else:
+            import fcntl
+
+            while time.monotonic() < deadline:
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    acquired = True
+                    break
+                except (BlockingIOError, OSError):
+                    time.sleep(0.02)
+        if not acquired:
+            raise ExecutionAdmissionError(
+                f"execution launch fence unavailable for {db_path}"
+            )
+        yield db_path
+    finally:
+        try:
+            if acquired:
+                if _IS_WINDOWS:
+                    import msvcrt
+
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
 
 
 @contextlib.contextmanager
@@ -2750,6 +2882,26 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "block_recurrences",
             "block_recurrences INTEGER NOT NULL DEFAULT 0",
         )
+
+    launch_table_exists = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' "
+        "AND name='execution_launches'"
+    ).fetchone() is not None
+    if launch_table_exists:
+        launch_cols = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(execution_launches)")
+        }
+        if "exit_requested_at" not in launch_cols:
+            # The child may report that it has entered its shutdown path, but
+            # only a separate dispatcher/observer is allowed to certify that
+            # the exact PID + birth-time process is actually gone.
+            _add_column_if_missing(
+                conn,
+                "execution_launches",
+                "exit_requested_at",
+                "exit_requested_at INTEGER",
+            )
 
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
@@ -4781,6 +4933,15 @@ def execution_admission_status(
         "ORDER BY task_id",
         (row["authorization_id"],),
     ).fetchall()
+    launches = conn.execute(
+        "SELECT launch_id, task_id, run_id, claim_lock, claim_lane, state, "
+        "dispatcher_pid, worker_pid, worker_start_time, created_at, spawning_at, "
+        "pid_registered_at, started_at, exit_requested_at, exited_at, "
+        "revoked_at, failure_reason "
+        "FROM execution_launches WHERE authorization_id = ? "
+        "ORDER BY created_at, launch_id",
+        (row["authorization_id"],),
+    ).fetchall()
     return {
         "authorization_id": row["authorization_id"],
         "generation": int(row["generation"]),
@@ -4808,6 +4969,13 @@ def execution_admission_status(
                 "identity": json.loads(task["identity_json"]),
             }
             for task in tasks
+        ],
+        "launches": [
+            {
+                key: launch[key]
+                for key in launch.keys()
+            }
+            for launch in launches
         ],
     }
 
@@ -4927,6 +5095,22 @@ def _task_execution_identity(
     }
 
 
+def _effective_task_execution_identity(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    source_status: Optional[str],
+) -> dict[str, Any]:
+    """Freeze the identity the launched process will actually receive."""
+    identity = _task_execution_identity(conn, task_id)
+    if source_status == "review":
+        identity["skills"] = list(dict.fromkeys([
+            *(identity.get("skills") or []),
+            "sdlc-review",
+        ]))
+    return identity
+
+
 def bind_execution_admission(
     conn: sqlite3.Connection,
     *,
@@ -5027,7 +5211,26 @@ def bind_execution_admission(
                 raise ExecutionAdmissionError(
                     f"task {task_id} must have max_attempts=1"
                 )
-            identity = _task_execution_identity(conn, task_id)
+            if binding["execution_kind"] == "worker":
+                raw_identity = _task_execution_identity(conn, task_id)
+                workspace_path = raw_identity.get("workspace_path")
+                if raw_identity.get("workspace_kind") != "dir":
+                    raise ExecutionAdmissionError(
+                        f"worker task {task_id} must use an already-resolved dir workspace"
+                    )
+                if (
+                    not isinstance(workspace_path, str)
+                    or not os.path.isabs(workspace_path)
+                    or not os.path.isdir(workspace_path)
+                ):
+                    raise ExecutionAdmissionError(
+                        f"worker task {task_id} needs an existing absolute dir workspace"
+                    )
+            identity = _effective_task_execution_identity(
+                conn,
+                task_id,
+                source_status=binding["allowed_claim_status"],
+            )
             identity_sha256 = _execution_admission_sha256(identity)
             entries.append({
                 **binding,
@@ -5106,7 +5309,11 @@ def _assert_execution_admission_identities(
     if not entries:
         raise ExecutionAdmissionError("execution admission has no task bindings")
     for entry in entries:
-        identity = _task_execution_identity(conn, entry["task_id"])
+        identity = _effective_task_execution_identity(
+            conn,
+            entry["task_id"],
+            source_status=entry["allowed_claim_status"],
+        )
         identity_json = _execution_admission_json(identity)
         identity_sha256 = hashlib.sha256(identity_json.encode("utf-8")).hexdigest()
         if (
@@ -5260,42 +5467,59 @@ def seal_execution_admission(
         raise ExecutionAdmissionError("seal reason must be 4-2000 characters")
     policy_sha256 = str(policy_sha256 or "").strip().lower()
     now = int(time.time())
-    with write_txn(conn):
-        admission = conn.execute(
-            "SELECT * FROM execution_admissions "
-            "WHERE authorization_id = ? AND live_slot = 1",
-            (str(authorization_id),),
-        ).fetchone()
-        if admission is None:
-            raise ExecutionAdmissionError("live execution admission not found")
-        if (
-            int(admission["generation"]) != int(generation)
-            or admission["policy_sha256"] != policy_sha256
-        ):
-            raise ExecutionAdmissionError("execution admission CAS mismatch")
-        if admission["state"] == "sealed":
-            if admission["terminal_reason"] != reason:
+    with _execution_launch_fence(conn):
+        with write_txn(conn):
+            admission = conn.execute(
+                "SELECT * FROM execution_admissions "
+                "WHERE authorization_id = ? AND live_slot = 1",
+                (str(authorization_id),),
+            ).fetchone()
+            if admission is None:
+                raise ExecutionAdmissionError("live execution admission not found")
+            if (
+                int(admission["generation"]) != int(generation)
+                or admission["policy_sha256"] != policy_sha256
+            ):
+                raise ExecutionAdmissionError("execution admission CAS mismatch")
+            _reconcile_execution_launch_exits_locked(
+                conn,
+                authorization_id=authorization_id,
+            )
+            live_launch = conn.execute(
+                "SELECT launch_id, state FROM execution_launches "
+                "WHERE authorization_id = ? AND state IN "
+                "('reserved','spawning','started','revoking') "
+                "ORDER BY created_at LIMIT 1",
+                (authorization_id,),
+            ).fetchone()
+            if live_launch is not None:
                 raise ExecutionAdmissionError(
-                    "sealed execution admission has a different terminal reason"
+                    "cannot seal while execution launch is "
+                    f"{live_launch['state']}: {live_launch['launch_id']}"
                 )
-            return execution_admission_status(conn, authorization_id) or {}
-        if admission["state"] not in {"prepared", "active"}:
-            raise ExecutionAdmissionError(
-                f"execution admission is {admission['state']}, cannot seal"
+            if admission["state"] == "sealed":
+                if admission["terminal_reason"] != reason:
+                    raise ExecutionAdmissionError(
+                        "sealed execution admission has a different terminal reason"
+                    )
+                return execution_admission_status(conn, authorization_id) or {}
+            if admission["state"] not in {"prepared", "active"}:
+                raise ExecutionAdmissionError(
+                    f"execution admission is {admission['state']}, cannot seal"
+                )
+            running = conn.execute(
+                "SELECT id FROM tasks WHERE status = 'running' ORDER BY id LIMIT 1"
+            ).fetchone()
+            if running is not None:
+                raise ExecutionAdmissionError(
+                    f"cannot seal while task is running: {running['id']}"
+                )
+            conn.execute(
+                "UPDATE execution_admissions "
+                "SET state = 'sealed', sealed_at = ?, terminal_reason = ? "
+                "WHERE authorization_id = ? AND live_slot = 1",
+                (now, reason, authorization_id),
             )
-        running = conn.execute(
-            "SELECT id FROM tasks WHERE status = 'running' ORDER BY id LIMIT 1"
-        ).fetchone()
-        if running is not None:
-            raise ExecutionAdmissionError(
-                f"cannot seal while task is running: {running['id']}"
-            )
-        conn.execute(
-            "UPDATE execution_admissions "
-            "SET state = 'sealed', sealed_at = ?, terminal_reason = ? "
-            "WHERE authorization_id = ? AND live_slot = 1",
-            (now, reason, authorization_id),
-        )
     return execution_admission_status(conn, authorization_id) or {}
 
 
@@ -5309,30 +5533,46 @@ def close_execution_admission(
     """Release a sealed board barrier while preserving its durable history."""
     policy_sha256 = str(policy_sha256 or "").strip().lower()
     now = int(time.time())
-    with write_txn(conn):
-        admission = conn.execute(
-            "SELECT * FROM execution_admissions WHERE authorization_id = ?",
-            (str(authorization_id),),
-        ).fetchone()
-        if admission is None:
-            raise ExecutionAdmissionError("execution admission not found")
-        if (
-            int(admission["generation"]) != int(generation)
-            or admission["policy_sha256"] != policy_sha256
-        ):
-            raise ExecutionAdmissionError("execution admission CAS mismatch")
-        if admission["state"] == "closed":
-            return execution_admission_status(conn, authorization_id) or {}
-        if admission["state"] != "sealed":
-            raise ExecutionAdmissionError(
-                f"execution admission is {admission['state']}, not sealed"
+    with _execution_launch_fence(conn):
+        with write_txn(conn):
+            admission = conn.execute(
+                "SELECT * FROM execution_admissions WHERE authorization_id = ?",
+                (str(authorization_id),),
+            ).fetchone()
+            if admission is None:
+                raise ExecutionAdmissionError("execution admission not found")
+            if (
+                int(admission["generation"]) != int(generation)
+                or admission["policy_sha256"] != policy_sha256
+            ):
+                raise ExecutionAdmissionError("execution admission CAS mismatch")
+            if admission["state"] == "closed":
+                return execution_admission_status(conn, authorization_id) or {}
+            if admission["state"] != "sealed":
+                raise ExecutionAdmissionError(
+                    f"execution admission is {admission['state']}, not sealed"
+                )
+            _reconcile_execution_launch_exits_locked(
+                conn,
+                authorization_id=authorization_id,
             )
-        conn.execute(
-            "UPDATE execution_admissions "
-            "SET state = 'closed', live_slot = NULL, closed_at = ? "
-            "WHERE authorization_id = ? AND state = 'sealed' AND live_slot = 1",
-            (now, authorization_id),
-        )
+            live_launch = conn.execute(
+                "SELECT launch_id, state FROM execution_launches "
+                "WHERE authorization_id = ? AND state IN "
+                "('reserved','spawning','started','revoking') LIMIT 1",
+                (authorization_id,),
+            ).fetchone()
+            if live_launch is not None:
+                raise ExecutionAdmissionError(
+                    "cannot close while execution launch is "
+                    f"{live_launch['state']}: {live_launch['launch_id']}"
+                )
+            conn.execute(
+                "UPDATE execution_admissions "
+                "SET state = 'closed', live_slot = NULL, closed_at = ? "
+                "WHERE authorization_id = ? AND state = 'sealed' AND live_slot = 1",
+                (now, authorization_id),
+            )
     return execution_admission_status(conn, authorization_id) or {}
 
 
@@ -5369,7 +5609,11 @@ def execution_admission_decision(
     if entry["allowed_claim_status"] != source_status:
         return False, "execution_admission_claim_lane_mismatch", context
     try:
-        identity = _task_execution_identity(conn, task_id)
+        identity = _effective_task_execution_identity(
+            conn,
+            task_id,
+            source_status=source_status,
+        )
     except ExecutionAdmissionError:
         return False, "execution_admission_task_missing", context
     identity_json = _execution_admission_json(identity)
@@ -5385,6 +5629,229 @@ def execution_admission_decision(
     if attempts >= 1:
         return False, "execution_admission_attempt_spent", context
     return True, None, context
+
+
+def _reserve_execution_launch(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    run_id: int,
+    claim_lock: str,
+    source_status: str,
+    admission_context: Optional[Mapping[str, Any]],
+) -> Optional[dict[str, str]]:
+    """Reserve the one-use child startup capability inside the claim txn."""
+    if admission_context is None:
+        return None
+    admission = _live_execution_admission(conn)
+    if admission is None or admission["state"] != "active":
+        raise ExecutionAdmissionError("active execution admission disappeared")
+    entry = conn.execute(
+        "SELECT * FROM execution_admission_tasks "
+        "WHERE authorization_id = ? AND task_id = ?",
+        (admission["authorization_id"], task_id),
+    ).fetchone()
+    if (
+        entry is None
+        or entry["execution_kind"] != "worker"
+        or entry["allowed_claim_status"] != source_status
+    ):
+        raise ExecutionAdmissionError("execution launch binding changed")
+    db_path = _connection_db_path(conn)
+    db_text = str(db_path)
+    launch_id = "xl_" + secrets.token_hex(16)
+    nonce = secrets.token_urlsafe(48)
+    now = int(time.time())
+    conn.execute(
+        "INSERT INTO execution_launches ("
+        "launch_id, authorization_id, task_id, run_id, claim_lock, claim_lane, "
+        "generation, policy_sha256, board_db_path, board_sha256, identity_sha256, "
+        "nonce_sha256, state, dispatcher_pid, created_at"
+        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'reserved', ?, ?)",
+        (
+            launch_id,
+            admission["authorization_id"],
+            task_id,
+            int(run_id),
+            claim_lock,
+            source_status,
+            int(admission["generation"]),
+            admission["policy_sha256"],
+            db_text,
+            hashlib.sha256(db_text.encode("utf-8")).hexdigest(),
+            entry["identity_sha256"],
+            hashlib.sha256(nonce.encode("utf-8")).hexdigest(),
+            os.getpid(),
+            now,
+        ),
+    )
+    _append_event(
+        conn,
+        task_id,
+        "execution_launch_reserved",
+        {
+            "launch_id": launch_id,
+            "authorization_id": admission["authorization_id"],
+            "generation": int(admission["generation"]),
+            "policy_sha256": admission["policy_sha256"],
+            "claim_lane": source_status,
+            "board_sha256": hashlib.sha256(db_text.encode("utf-8")).hexdigest(),
+        },
+        run_id=int(run_id),
+    )
+    return {"launch_id": launch_id, "nonce": nonce, "db_path": db_text}
+
+
+def _attach_execution_launch(
+    task: Optional[Task],
+    launch: Optional[Mapping[str, str]],
+    *,
+    source_status: str,
+) -> Optional[Task]:
+    if task is not None and launch is not None:
+        task.execution_launch_id = launch["launch_id"]
+        task.execution_launch_nonce = launch["nonce"]
+        task.execution_launch_db_path = launch["db_path"]
+        task.execution_launch_lane = source_status
+    return task
+
+
+def _execution_launch_row(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    run_id: Optional[int] = None,
+) -> Optional[sqlite3.Row]:
+    if run_id is None:
+        return conn.execute(
+            "SELECT * FROM execution_launches WHERE task_id = ? "
+            "ORDER BY created_at DESC, launch_id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+    return conn.execute(
+        "SELECT * FROM execution_launches WHERE task_id = ? AND run_id = ?",
+        (task_id, int(run_id)),
+    ).fetchone()
+
+
+def _validate_launch_binding(
+    conn: sqlite3.Connection,
+    launch: sqlite3.Row,
+    *,
+    require_state: set[str],
+    workspace: Optional[str] = None,
+) -> tuple[sqlite3.Row, sqlite3.Row]:
+    if launch["state"] not in require_state:
+        raise ExecutionAdmissionError(
+            f"execution launch is {launch['state']}, expected {sorted(require_state)}"
+        )
+    db_path = str(_connection_db_path(conn))
+    if (
+        launch["board_db_path"] != db_path
+        or launch["board_sha256"]
+        != hashlib.sha256(db_path.encode("utf-8")).hexdigest()
+    ):
+        raise ExecutionAdmissionError("execution launch board identity mismatch")
+    task = conn.execute(
+        "SELECT * FROM tasks WHERE id = ?",
+        (launch["task_id"],),
+    ).fetchone()
+    run = conn.execute(
+        "SELECT * FROM task_runs WHERE id = ? AND task_id = ?",
+        (int(launch["run_id"]), launch["task_id"]),
+    ).fetchone()
+    if task is None or run is None:
+        raise ExecutionAdmissionError("execution launch task/run disappeared")
+    if (
+        task["status"] != "running"
+        or int(task["current_run_id"] or 0) != int(launch["run_id"])
+        or task["claim_lock"] != launch["claim_lock"]
+        or run["ended_at"] is not None
+        or run["claim_lock"] != launch["claim_lock"]
+    ):
+        raise ExecutionAdmissionError("execution launch claim/run mismatch")
+    if not _parents_satisfied(conn, launch["task_id"]):
+        raise ExecutionAdmissionError("execution launch parent reopened")
+    if workspace is not None:
+        if (
+            task["workspace_kind"] != "dir"
+            or task["workspace_path"] != workspace
+            or not os.path.isabs(workspace)
+            or not os.path.isdir(workspace)
+        ):
+            raise ExecutionAdmissionError("execution launch workspace identity mismatch")
+    admission = conn.execute(
+        "SELECT * FROM execution_admissions "
+        "WHERE authorization_id = ? AND live_slot = 1",
+        (launch["authorization_id"],),
+    ).fetchone()
+    if (
+        admission is None
+        or admission["state"] != "active"
+        or int(admission["generation"]) != int(launch["generation"])
+        or admission["policy_sha256"] != launch["policy_sha256"]
+    ):
+        raise ExecutionAdmissionError("execution launch admission changed")
+    if _execution_admission_policy_error(conn, admission) is not None:
+        raise ExecutionAdmissionError("execution launch admission policy invalid")
+    entry = conn.execute(
+        "SELECT * FROM execution_admission_tasks "
+        "WHERE authorization_id = ? AND task_id = ?",
+        (launch["authorization_id"], launch["task_id"]),
+    ).fetchone()
+    if (
+        entry is None
+        or entry["execution_kind"] != "worker"
+        or entry["allowed_claim_status"] != launch["claim_lane"]
+    ):
+        raise ExecutionAdmissionError("execution launch lane binding mismatch")
+    identity = _effective_task_execution_identity(
+        conn,
+        launch["task_id"],
+        source_status=launch["claim_lane"],
+    )
+    identity_json = _execution_admission_json(identity)
+    identity_sha256 = hashlib.sha256(identity_json.encode("utf-8")).hexdigest()
+    if (
+        identity_sha256 != launch["identity_sha256"]
+        or identity_sha256 != entry["identity_sha256"]
+        or identity_json != entry["identity_json"]
+    ):
+        raise ExecutionAdmissionError("execution launch identity mismatch")
+    return task, run
+
+
+def _mark_execution_launch_spawning(
+    conn: sqlite3.Connection,
+    task: Task,
+    workspace: str,
+) -> None:
+    if not task.execution_launch_id:
+        return
+    with write_txn(conn):
+        launch = conn.execute(
+            "SELECT * FROM execution_launches WHERE launch_id = ?",
+            (task.execution_launch_id,),
+        ).fetchone()
+        if launch is None:
+            raise ExecutionAdmissionError("execution launch reservation missing")
+        _validate_launch_binding(
+            conn, launch, require_state={"reserved"}, workspace=workspace,
+        )
+        cur = conn.execute(
+            "UPDATE execution_launches SET state = 'spawning', spawning_at = ? "
+            "WHERE launch_id = ? AND state = 'reserved'",
+            (int(time.time()), task.execution_launch_id),
+        )
+        if cur.rowcount != 1:
+            raise ExecutionAdmissionError("execution launch spawning CAS failed")
+        _append_event(
+            conn,
+            task.id,
+            "execution_launch_spawning",
+            {"launch_id": task.execution_launch_id},
+            run_id=task.current_run_id,
+        )
 
 
 def _record_execution_admission_rejection(
@@ -5618,7 +6085,17 @@ def claim_task(
             },
             run_id=run_id,
         )
-        claimed = get_task(conn, task_id)
+        launch = _reserve_execution_launch(
+            conn,
+            task_id=task_id,
+            run_id=int(run_id),
+            claim_lock=lock,
+            source_status="ready",
+            admission_context=admission_context,
+        )
+        claimed = _attach_execution_launch(
+            get_task(conn, task_id), launch, source_status="ready",
+        )
     _fire_kanban_lifecycle_hook(
         "kanban_task_claimed",
         task_id,
@@ -5738,7 +6215,17 @@ def claim_review_task(
              )},
             run_id=run_id,
         )
-        return get_task(conn, task_id)
+        launch = _reserve_execution_launch(
+            conn,
+            task_id=task_id,
+            run_id=int(run_id),
+            claim_lock=lock,
+            source_status="review",
+            admission_context=admission_context,
+        )
+        return _attach_execution_launch(
+            get_task(conn, task_id), launch, source_status="review",
+        )
 
 
 def _retry_status_for_run(
@@ -5893,7 +6380,7 @@ def release_stale_claims(
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
     stale = conn.execute(
         "SELECT id, claim_lock, worker_pid, claim_expires, last_heartbeat_at, "
-        "       assignee "
+        "       assignee, current_run_id "
         "FROM tasks "
         "WHERE status = 'running' AND claim_expires IS NOT NULL "
         "  AND claim_expires < ?",
@@ -5951,6 +6438,26 @@ def release_stale_claims(
                     },
                     run_id=run_id,
                 )
+            continue
+
+        launch = _execution_launch_row(
+            conn,
+            row["id"],
+            run_id=(
+                int(row["current_run_id"])
+                if row["current_run_id"] is not None else None
+            ),
+        )
+        if launch is not None and launch["state"] in {
+            "reserved", "spawning", "started", "revoking",
+        }:
+            if _revoke_execution_launch_for_reclaim(
+                conn,
+                launch_id=launch["launch_id"],
+                reason="expired admitted worker claim",
+                signal_fn=signal_fn,
+            ):
+                reclaimed += 1
             continue
 
         termination = _terminate_reclaimed_worker(
@@ -6025,6 +6532,146 @@ def release_stale_claims(
     return reclaimed
 
 
+def _revoke_execution_launch_for_reclaim(
+    conn: sqlite3.Connection,
+    *,
+    launch_id: str,
+    reason: str,
+    signal_fn=None,
+) -> bool:
+    """Revoke an admitted launch without ever losing uncertain ownership."""
+    with _execution_launch_fence(conn):
+        with write_txn(conn):
+            launch = conn.execute(
+                "SELECT * FROM execution_launches WHERE launch_id = ?",
+                (launch_id,),
+            ).fetchone()
+            if launch is None:
+                return False
+            if launch["state"] in {"exited", "revoked", "failed"}:
+                return False
+            task = conn.execute(
+                "SELECT status, current_run_id, claim_lock FROM tasks WHERE id = ?",
+                (launch["task_id"],),
+            ).fetchone()
+            if (
+                task is None
+                or task["status"] != "running"
+                or int(task["current_run_id"] or 0) != int(launch["run_id"])
+                or task["claim_lock"] != launch["claim_lock"]
+            ):
+                raise ExecutionAdmissionError(
+                    "cannot revoke execution launch after ownership drift"
+                )
+            if launch["state"] != "revoking":
+                conn.execute(
+                    "UPDATE execution_launches SET state = 'revoking', "
+                    "failure_reason = ? WHERE launch_id = ? AND state IN "
+                    "('reserved','spawning','started')",
+                    (str(reason)[:2000], launch_id),
+                )
+                _append_event(
+                    conn,
+                    launch["task_id"],
+                    "execution_launch_revoking",
+                    {"launch_id": launch_id, "reason": str(reason)[:500]},
+                    run_id=int(launch["run_id"]),
+                )
+
+        # The state is durably revoking before process mutation. Keep the
+        # cross-process fence while terminating and committing final ownership.
+        pid = launch["worker_pid"]
+        if pid is None and launch["state"] == "reserved":
+            termination: dict[str, Any] = {
+                "prev_pid": None,
+                "host_local": True,
+                "termination_attempted": False,
+                "terminated": True,
+                "sigkill": False,
+                "spawn_never_started": True,
+            }
+        elif pid is None:
+            # Once spawning begins, absence of a returned/durable PID does not
+            # prove Popen failed before creating a child. Preserve ownership;
+            # never convert uncertainty into permission to retry.
+            termination = {
+                "prev_pid": None,
+                "host_local": True,
+                "termination_attempted": False,
+                "terminated": False,
+                "sigkill": False,
+                "identity_mismatch": True,
+                "error": "spawning launch has no durable process identity",
+            }
+        elif launch["worker_start_time"] is None:
+            termination = {
+                "prev_pid": int(pid),
+                "host_local": True,
+                "termination_attempted": False,
+                "terminated": False,
+                "sigkill": False,
+                "identity_mismatch": True,
+                "error": "missing durable process start time",
+            }
+        else:
+            termination = _terminate_execution_worker(
+                int(pid),
+                launch["claim_lock"],
+                signal_fn=signal_fn,
+                expected_start_time=int(launch["worker_start_time"]),
+            )
+
+        if not termination.get("terminated"):
+            with write_txn(conn):
+                _append_event(
+                    conn,
+                    launch["task_id"],
+                    "execution_launch_revocation_deferred",
+                    {"launch_id": launch_id, **termination},
+                    run_id=int(launch["run_id"]),
+                )
+            return False
+
+        with write_txn(conn):
+            current = conn.execute(
+                "SELECT * FROM execution_launches WHERE launch_id = ?",
+                (launch_id,),
+            ).fetchone()
+            if current is None or current["state"] != "revoking":
+                return False
+            observation = termination.get("process_observation") or {
+                "state": "dead",
+                "pid": current["worker_pid"],
+                "expected_start_time": current["worker_start_time"],
+                "reason": (
+                    "spawn_never_started"
+                    if termination.get("spawn_never_started")
+                    else "signal_reported_process_absent"
+                ),
+            }
+            terminalized, task_reclaimed = (
+                _finalize_dead_revoking_launch_locked(
+                    conn,
+                    current,
+                    observation=observation,
+                )
+            )
+            if not terminalized:
+                _append_event(
+                    conn,
+                    current["task_id"],
+                    "execution_launch_revocation_deferred",
+                    {
+                        "launch_id": launch_id,
+                        "reason": "task/run ownership changed without terminal proof",
+                        **termination,
+                    },
+                    run_id=int(current["run_id"]),
+                )
+                return False
+        return task_reclaimed
+
+
 def reclaim_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -6044,7 +6691,7 @@ def reclaim_task(
     reclaimable state (not running, or doesn't exist).
     """
     row = conn.execute(
-        "SELECT status, claim_lock, worker_pid FROM tasks WHERE id = ?",
+        "SELECT status, claim_lock, worker_pid, current_run_id FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
     if not row:
@@ -6052,6 +6699,23 @@ def reclaim_task(
     if row["status"] != "running" and row["claim_lock"] is None:
         # Nothing to reclaim — already ready / blocked / done.
         return False
+    launch = _execution_launch_row(
+        conn,
+        task_id,
+        run_id=(
+            int(row["current_run_id"])
+            if row["current_run_id"] is not None else None
+        ),
+    )
+    if launch is not None and launch["state"] in {
+        "reserved", "spawning", "started", "revoking",
+    }:
+        return _revoke_execution_launch_for_reclaim(
+            conn,
+            launch_id=launch["launch_id"],
+            reason=reason or "manual reclaim",
+            signal_fn=signal_fn,
+        )
     prev_lock = row["claim_lock"]
     termination = _terminate_reclaimed_worker(
         row["worker_pid"], prev_lock, signal_fn=signal_fn,
@@ -8425,6 +9089,14 @@ def decompose_triage_task(
 
 
 def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
+    launch = _execution_launch_row(conn, task_id)
+    if launch is not None and launch["state"] in {
+        "reserved", "spawning", "started", "revoking",
+    }:
+        # Archiving used to clear ownership without terminating the worker.
+        # An admitted launch must be explicitly reclaimed through its fenced
+        # process-identity path first.
+        return False
     with write_txn(conn):
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
@@ -9177,11 +9849,171 @@ def _pid_alive(pid: Optional[int]) -> bool:
     return True
 
 
+def _observe_execution_process_identity(
+    pid: int,
+    expected_start_time: int,
+) -> dict[str, Any]:
+    """Return ``alive``, ``dead``, or ``unknown`` for an exact process.
+
+    Execution-admission ownership must never use a lossy boolean liveness
+    helper: a failed status probe is uncertainty, not death.  Prefer psutil's
+    same-process creation time and explicit status.  The POSIX fallback keeps
+    the same fail-closed three-way contract.
+    """
+    info: dict[str, Any] = {
+        "state": "unknown",
+        "pid": int(pid),
+        "expected_start_time": int(expected_start_time),
+        "observed_start_time": None,
+    }
+    try:
+        import psutil  # type: ignore
+
+        try:
+            process = psutil.Process(int(pid))
+            status = process.status()
+        except psutil.NoSuchProcess:
+            return {**info, "state": "dead", "reason": "pid_absent"}
+        except psutil.ZombieProcess:
+            return {**info, "state": "dead", "reason": "process_zombie"}
+        except psutil.AccessDenied as exc:
+            return {**info, "reason": f"process inspection denied: {exc}"}
+        except Exception as exc:
+            return {**info, "reason": f"process inspection failed: {exc}"}
+        # Use the exact same platform representation as PID registration and
+        # nonce consumption (/proc ticks on Linux, psutil epoch centiseconds
+        # elsewhere). Mixing representations would classify every Linux PID
+        # as reused.
+        observed_start = _worker_process_start_time(int(pid))
+        info["observed_start_time"] = observed_start
+        if observed_start is None:
+            return {**info, "reason": "process birth time unavailable"}
+        if observed_start != int(expected_start_time):
+            return {**info, "state": "dead", "reason": "pid_reused"}
+        dead_statuses = {
+            value
+            for value in (
+                getattr(psutil, "STATUS_ZOMBIE", None),
+                getattr(psutil, "STATUS_DEAD", None),
+            )
+            if value is not None
+        }
+        if status in dead_statuses:
+            return {**info, "state": "dead", "reason": f"status_{status}"}
+        return {**info, "state": "alive", "reason": f"status_{status}"}
+    except ImportError:
+        pass
+
+    if _IS_WINDOWS:
+        return {**info, "reason": "psutil unavailable on Windows"}
+    try:
+        os.kill(int(pid), 0)
+    except ProcessLookupError:
+        return {**info, "state": "dead", "reason": "pid_absent"}
+    except PermissionError as exc:
+        return {**info, "reason": f"process inspection denied: {exc}"}
+    except OSError as exc:
+        return {**info, "reason": f"process inspection failed: {exc}"}
+    observed_start = _worker_process_start_time(int(pid))
+    info["observed_start_time"] = observed_start
+    if observed_start is None:
+        return {**info, "reason": "process birth time unavailable"}
+    if int(observed_start) != int(expected_start_time):
+        return {**info, "state": "dead", "reason": "pid_reused"}
+    return {**info, "state": "alive", "reason": "posix_identity_match"}
+
+
+def _terminate_execution_worker(
+    pid: int,
+    claim_lock: Optional[str],
+    *,
+    expected_start_time: int,
+    signal_fn=None,
+) -> dict[str, Any]:
+    """Terminate only a durably identified execution-admitted process."""
+    import signal
+
+    info: dict[str, Any] = {
+        "prev_pid": int(pid),
+        "host_local": False,
+        "termination_attempted": False,
+        "terminated": False,
+        "sigkill": False,
+        "expected_start_time": int(expected_start_time),
+    }
+    if not claim_lock:
+        return info
+    host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
+    if not str(claim_lock).startswith(host_prefix):
+        return info
+    info["host_local"] = True
+    observation = _observe_execution_process_identity(
+        int(pid), int(expected_start_time),
+    )
+    info["process_observation"] = observation
+    if observation["state"] == "dead":
+        info["terminated"] = True
+        info["already_gone"] = True
+        return info
+    if observation["state"] != "alive":
+        info["identity_mismatch"] = True
+        info["error"] = observation.get("reason", "process identity unknown")
+        return info
+
+    kill = signal_fn if signal_fn is not None else (
+        os.kill if hasattr(os, "kill") else None
+    )
+    if kill is None:
+        return info
+    info["termination_attempted"] = True
+    try:
+        kill(int(pid), signal.SIGTERM)
+    except ProcessLookupError:
+        info["terminated"] = True
+        return info
+    except OSError as exc:
+        info["error"] = str(exc)
+        return info
+
+    for _ in range(10):
+        observation = _observe_execution_process_identity(
+            int(pid), int(expected_start_time),
+        )
+        info["process_observation"] = observation
+        if observation["state"] == "dead":
+            info["terminated"] = True
+            return info
+        if observation["state"] == "unknown":
+            info["error"] = observation.get("reason", "process identity unknown")
+            return info
+        time.sleep(0.5)
+
+    try:
+        _sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
+        kill(int(pid), _sigkill)
+        info["sigkill"] = True
+    except ProcessLookupError:
+        info["terminated"] = True
+        return info
+    except OSError as exc:
+        info["error"] = str(exc)
+        return info
+    observation = _observe_execution_process_identity(
+        int(pid), int(expected_start_time),
+    )
+    info["process_observation"] = observation
+    info["terminated"] = observation["state"] == "dead"
+    if observation["state"] == "unknown":
+        info["error"] = observation.get("reason", "process identity unknown")
+    return info
+
+
 def _terminate_reclaimed_worker(
     pid: Optional[int],
     claim_lock: Optional[str],
     *,
     signal_fn=None,
+    expected_start_time: Optional[int] = None,
 ) -> dict[str, Any]:
     """Best-effort host-local worker termination for reclaim paths."""
     import signal
@@ -9200,6 +10032,22 @@ def _terminate_reclaimed_worker(
     if not str(claim_lock).startswith(host_prefix):
         return info
     info["host_local"] = True
+
+    if not _pid_alive(int(pid)):
+        info["terminated"] = True
+        info["already_gone"] = True
+        return info
+
+    if expected_start_time is not None:
+        current_start_time = _worker_process_start_time(int(pid))
+        info["expected_start_time"] = int(expected_start_time)
+        info["observed_start_time"] = current_start_time
+        if (
+            current_start_time is None
+            or int(current_start_time) != int(expected_start_time)
+        ):
+            info["identity_mismatch"] = True
+            return info
 
     kill = signal_fn if signal_fn is not None else (
         os.kill if hasattr(os, "kill") else None
@@ -9372,7 +10220,7 @@ def enforce_max_runtime(
     rows = conn.execute(
         "SELECT t.id, t.worker_pid, "
         "       COALESCE(r.started_at, t.started_at) AS active_started_at, "
-        "       t.max_runtime_seconds, t.claim_lock "
+        "       t.max_runtime_seconds, t.claim_lock, t.current_run_id "
         "FROM tasks t "
         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
         "WHERE t.status = 'running' AND t.max_runtime_seconds IS NOT NULL "
@@ -9392,6 +10240,38 @@ def enforce_max_runtime(
 
         pid = int(row["worker_pid"])
         tid = row["id"]
+        launch = _execution_launch_row(
+            conn,
+            tid,
+            run_id=(
+                int(row["current_run_id"])
+                if row["current_run_id"] is not None else None
+            ),
+        )
+        if launch is not None and launch["state"] in {
+            "reserved", "spawning", "started", "revoking",
+        }:
+            if _revoke_execution_launch_for_reclaim(
+                conn,
+                launch_id=launch["launch_id"],
+                reason=(
+                    f"runtime exceeded {int(row['max_runtime_seconds'])} seconds"
+                ),
+                signal_fn=signal_fn,
+            ):
+                timed_out.append(tid)
+                _record_task_failure(
+                    conn,
+                    tid,
+                    error=(
+                        f"elapsed {int(elapsed)}s > limit "
+                        f"{int(row['max_runtime_seconds'])}s"
+                    ),
+                    outcome="timed_out",
+                    release_claim=False,
+                    end_run=False,
+                )
+            continue
         # SIGTERM then SIGKILL. Keep it simple: 5 s grace. Workers that
         # want a cleaner shutdown can install their own SIGTERM handler
         # before the grace expires.
@@ -9511,6 +10391,7 @@ def detect_stale_running(
 
     rows = conn.execute(
         "SELECT t.id, t.worker_pid, t.last_heartbeat_at, t.claim_lock, "
+        "       t.current_run_id, "
         "       COALESCE(r.started_at, t.started_at) AS active_started_at "
         "FROM tasks t "
         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
@@ -9534,6 +10415,26 @@ def detect_stale_running(
         pid = row["worker_pid"]
         tid = row["id"]
         lock = row["claim_lock"] or ""
+
+        launch = _execution_launch_row(
+            conn,
+            tid,
+            run_id=(
+                int(row["current_run_id"])
+                if row["current_run_id"] is not None else None
+            ),
+        )
+        if launch is not None and launch["state"] in {
+            "reserved", "spawning", "started", "revoking",
+        }:
+            if _revoke_execution_launch_for_reclaim(
+                conn,
+                launch_id=launch["launch_id"],
+                reason="admitted worker heartbeat stale",
+                signal_fn=signal_fn,
+            ):
+                reclaimed.append(tid)
+            continue
 
         # Terminate the worker if it's still host-local.
         termination = _terminate_reclaimed_worker(
@@ -9631,13 +10532,30 @@ def reconcile_orphaned_running(
     now = int(time.time())
     reconciled: list[str] = []
     rows = conn.execute(
-        "SELECT id, claim_lock, claim_expires, worker_pid FROM tasks "
+        "SELECT id, claim_lock, claim_expires, worker_pid, current_run_id FROM tasks "
         "WHERE status = 'running' "
         "  AND (claim_lock IS NULL OR claim_expires IS NULL)"
     ).fetchall()
     for row in rows:
         tid = row["id"]
         pid = row["worker_pid"]
+        launch = _execution_launch_row(
+            conn,
+            tid,
+            run_id=(
+                int(row["current_run_id"])
+                if row["current_run_id"] is not None else None
+            ),
+        )
+        if launch is not None and launch["state"] in {
+            "reserved", "spawning", "started", "revoking",
+        }:
+            _log.error(
+                "kanban reconcile: refusing to clear admitted launch %s with "
+                "broken ownership; manual fenced recovery required",
+                launch["launch_id"],
+            )
+            continue
         if pid and _pid_alive(pid):
             # The recorded worker may still be doing real work — never
             # requeue beside a live process. Retry next tick.
@@ -9817,6 +10735,45 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # Worker-exit observer payloads (RFC #58548), collected inside the main
     # txn and fired only after every reclaim/accounting txn has committed.
     exited_hook_payloads: list[dict] = []
+    # Admitted launches have stronger ownership semantics than legacy tasks.
+    # Revoke their durable process identity under the launch fence before the
+    # ordinary bulk transaction clears any claim/run columns.
+    admitted_dead = conn.execute(
+        "SELECT id, worker_pid, claim_lock, current_run_id FROM tasks "
+        "WHERE status = 'running' AND worker_pid IS NOT NULL"
+    ).fetchall()
+    host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
+    for candidate in admitted_dead:
+        lock = candidate["claim_lock"] or ""
+        if not lock.startswith(host_prefix) or _pid_alive(candidate["worker_pid"]):
+            continue
+        launch = _execution_launch_row(
+            conn,
+            candidate["id"],
+            run_id=(
+                int(candidate["current_run_id"])
+                if candidate["current_run_id"] is not None else None
+            ),
+        )
+        if launch is None or launch["state"] not in {
+            "reserved", "spawning", "started", "revoking",
+        }:
+            continue
+        pid = int(candidate["worker_pid"])
+        if _revoke_execution_launch_for_reclaim(
+            conn,
+            launch_id=launch["launch_id"],
+            reason=f"authorized worker pid {pid} exited",
+        ):
+            crashed.append(candidate["id"])
+            _record_task_failure(
+                conn,
+                candidate["id"],
+                error=f"pid {pid} not alive",
+                outcome="crashed",
+                release_claim=False,
+                end_run=False,
+            )
     with write_txn(conn):
         rows = conn.execute(
             "SELECT id, worker_pid, claim_lock, started_at, assignee "
@@ -10270,25 +11227,510 @@ def _record_spawn_failure(
     )
 
 
-def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
+def _worker_process_start_time(pid: int) -> Optional[int]:
+    try:
+        from gateway.status import get_process_start_time
+
+        value = get_process_start_time(int(pid))
+        return int(value) if value is not None else None
+    except Exception:
+        return None
+
+
+def _set_worker_pid(
+    conn: sqlite3.Connection,
+    task_id: str,
+    pid: int,
+    *,
+    expected_run_id: Optional[int] = None,
+    expected_claim_lock: Optional[str] = None,
+    execution_launch_id: Optional[str] = None,
+) -> None:
     """Record the spawned child's pid + emit a ``spawned`` event.
 
     The event's payload carries the pid so a human reading ``hermes kanban
     tail`` can correlate log lines with OS-level traces without opening
     the drawer.
     """
+    unavailable_start_time = False
     with write_txn(conn):
-        conn.execute(
-            "UPDATE tasks SET worker_pid = ? WHERE id = ?",
-            (int(pid), task_id),
-        )
-        run_id = _current_run_id(conn, task_id)
-        if run_id is not None:
-            conn.execute(
-                "UPDATE task_runs SET worker_pid = ? WHERE id = ?",
-                (int(pid), run_id),
+        if execution_launch_id is not None:
+            if expected_run_id is None or not expected_claim_lock:
+                raise ExecutionAdmissionError(
+                    "admitted PID registration needs exact run and claim"
+                )
+            launch = conn.execute(
+                "SELECT * FROM execution_launches WHERE launch_id = ?",
+                (execution_launch_id,),
+            ).fetchone()
+            if launch is None:
+                raise ExecutionAdmissionError("execution launch reservation missing")
+            _validate_launch_binding(
+                conn, launch, require_state={"spawning"},
             )
-        _append_event(conn, task_id, "spawned", {"pid": int(pid)}, run_id=run_id)
+            if (
+                int(launch["run_id"]) != int(expected_run_id)
+                or launch["claim_lock"] != expected_claim_lock
+                or launch["task_id"] != task_id
+            ):
+                raise ExecutionAdmissionError("execution launch PID CAS mismatch")
+            start_time = _worker_process_start_time(int(pid))
+            if start_time is None:
+                # Preserve the only process identifier the actual Popen call
+                # returned. It is deliberately *not* copied to task/run rows,
+                # because without a birth marker it can never be signalled or
+                # treated as a managed live worker. The durable launch remains
+                # held in `spawning` for external/manual proof.
+                launch_cur = conn.execute(
+                    "UPDATE execution_launches SET worker_pid = ?, "
+                    "pid_registered_at = ? WHERE launch_id = ? "
+                    "AND state = 'spawning' AND worker_pid IS NULL",
+                    (int(pid), int(time.time()), execution_launch_id),
+                )
+                if launch_cur.rowcount != 1:
+                    raise ExecutionAdmissionError(
+                        "launch PID uncertainty registration CAS failed"
+                    )
+                _append_event(
+                    conn,
+                    task_id,
+                    "execution_launch_pid_unverified",
+                    {
+                        "launch_id": execution_launch_id,
+                        "pid": int(pid),
+                        "reason": "worker process start time is unavailable",
+                    },
+                    run_id=int(expected_run_id),
+                )
+                unavailable_start_time = True
+                run_id = int(expected_run_id)
+            else:
+                cur = conn.execute(
+                    "UPDATE tasks SET worker_pid = ? WHERE id = ? "
+                    "AND status = 'running' AND current_run_id = ? "
+                    "AND claim_lock = ? AND worker_pid IS NULL",
+                    (
+                        int(pid), task_id, int(expected_run_id),
+                        expected_claim_lock,
+                    ),
+                )
+                if cur.rowcount != 1:
+                    raise ExecutionAdmissionError("task PID registration CAS failed")
+                run_cur = conn.execute(
+                    "UPDATE task_runs SET worker_pid = ? WHERE id = ? "
+                    "AND task_id = ? AND claim_lock = ? AND ended_at IS NULL "
+                    "AND worker_pid IS NULL",
+                    (
+                        int(pid), int(expected_run_id), task_id,
+                        expected_claim_lock,
+                    ),
+                )
+                launch_cur = conn.execute(
+                    "UPDATE execution_launches SET worker_pid = ?, "
+                    "worker_start_time = ?, pid_registered_at = ? "
+                    "WHERE launch_id = ? AND state = 'spawning' "
+                    "AND worker_pid IS NULL",
+                    (int(pid), start_time, int(time.time()), execution_launch_id),
+                )
+                if run_cur.rowcount != 1 or launch_cur.rowcount != 1:
+                    raise ExecutionAdmissionError(
+                        "run/launch PID registration CAS failed"
+                    )
+                run_id = int(expected_run_id)
+        else:
+            conn.execute(
+                "UPDATE tasks SET worker_pid = ? WHERE id = ?",
+                (int(pid), task_id),
+            )
+            run_id = _current_run_id(conn, task_id)
+            if run_id is not None:
+                conn.execute(
+                    "UPDATE task_runs SET worker_pid = ? WHERE id = ?",
+                    (int(pid), run_id),
+                )
+        if not unavailable_start_time:
+            _append_event(
+                conn,
+                task_id,
+                "spawned",
+                {
+                    "pid": int(pid),
+                    **(
+                        {"execution_launch_id": execution_launch_id}
+                        if execution_launch_id is not None else {}
+                    ),
+                },
+                run_id=run_id,
+            )
+    if unavailable_start_time:
+        raise ExecutionAdmissionError("worker process start time is unavailable")
+
+
+def consume_execution_launch(
+    conn: sqlite3.Connection,
+    *,
+    launch_id: str,
+    nonce: str,
+    task_id: str,
+    run_id: int,
+    claim_lock: str,
+    worker_pid: int,
+) -> dict[str, Any]:
+    """Atomically consume one child startup nonce after parent PID publication."""
+    with _execution_launch_fence(conn):
+        with write_txn(conn):
+            launch = conn.execute(
+                "SELECT * FROM execution_launches WHERE launch_id = ?",
+                (str(launch_id),),
+            ).fetchone()
+            if launch is None:
+                raise ExecutionAdmissionError("execution launch not found")
+            _validate_launch_binding(
+                conn, launch, require_state={"spawning"},
+            )
+            if (
+                launch["task_id"] != task_id
+                or int(launch["run_id"]) != int(run_id)
+                or launch["claim_lock"] != claim_lock
+                or int(launch["worker_pid"] or 0) != int(worker_pid)
+                or launch["nonce_sha256"]
+                != hashlib.sha256(str(nonce).encode("utf-8")).hexdigest()
+            ):
+                raise ExecutionAdmissionError("execution launch startup proof mismatch")
+            current_start = _worker_process_start_time(int(worker_pid))
+            if (
+                current_start is None
+                or int(launch["worker_start_time"] or 0) != int(current_start)
+            ):
+                raise ExecutionAdmissionError("execution launch process identity changed")
+            cur = conn.execute(
+                "UPDATE execution_launches SET state = 'started', started_at = ? "
+                "WHERE launch_id = ? AND state = 'spawning'",
+                (int(time.time()), launch_id),
+            )
+            if cur.rowcount != 1:
+                raise ExecutionAdmissionError("execution launch nonce already consumed")
+            _append_event(
+                conn,
+                task_id,
+                "execution_launch_started",
+                {"launch_id": launch_id, "pid": int(worker_pid)},
+                run_id=int(run_id),
+            )
+            return {
+                "launch_id": launch_id,
+                "task_id": task_id,
+                "run_id": int(run_id),
+                "authorization_id": launch["authorization_id"],
+                "generation": int(launch["generation"]),
+                "policy_sha256": launch["policy_sha256"],
+            }
+
+
+def finish_execution_launch(
+    conn: sqlite3.Connection,
+    *,
+    launch_id: str,
+    worker_pid: int,
+) -> bool:
+    """Record only that the worker requested shutdown certification.
+
+    This runs inside the worker (including from ``atexit``), so it cannot
+    prove that the process is dead.  A separate dispatcher/observer owns the
+    ``started`` -> ``exited`` transition after checking the durable PID and
+    birth marker.
+    """
+    with _execution_launch_fence(conn):
+        with write_txn(conn):
+            launch = conn.execute(
+                "SELECT * FROM execution_launches WHERE launch_id = ?",
+                (str(launch_id),),
+            ).fetchone()
+            if launch is None:
+                return False
+            if launch["state"] == "exited":
+                return True
+            if (
+                launch["state"] != "started"
+                or int(launch["worker_pid"] or 0) != int(worker_pid)
+            ):
+                return False
+            if launch["exit_requested_at"] is not None:
+                return True
+            cur = conn.execute(
+                "UPDATE execution_launches SET exit_requested_at = ? "
+                "WHERE launch_id = ? AND state = 'started' AND worker_pid = ? "
+                "AND exit_requested_at IS NULL",
+                (int(time.time()), launch_id, int(worker_pid)),
+            )
+            if cur.rowcount != 1:
+                return False
+            _append_event(
+                conn,
+                launch["task_id"],
+                "execution_launch_exit_requested",
+                {"launch_id": launch_id, "pid": int(worker_pid)},
+                run_id=int(launch["run_id"]),
+            )
+            return True
+
+
+def _reconcile_execution_launch_exits_locked(
+    conn: sqlite3.Connection,
+    *,
+    authorization_id: Optional[str] = None,
+) -> int:
+    """Certify dead authorized processes while the launch fence is held.
+
+    The scan intentionally depends only on the durable launch ledger, not the
+    task's current phase.  A worker may complete/block its task and then crash
+    before its shutdown callback, and that process must still be observed.
+    """
+    query = (
+        "SELECT * FROM execution_launches "
+        "WHERE state IN ('started','revoking')"
+    )
+    params: tuple[Any, ...] = ()
+    if authorization_id is not None:
+        query += " AND authorization_id = ?"
+        params = (str(authorization_id),)
+    query += " ORDER BY created_at, launch_id"
+    rows = conn.execute(query, params).fetchall()
+    reconciled = 0
+    for launch in rows:
+        pid = launch["worker_pid"]
+        expected_start = launch["worker_start_time"]
+        if pid is None or expected_start is None:
+            # Missing durable identity is uncertainty, never proof of death.
+            continue
+        pid = int(pid)
+        expected_start = int(expected_start)
+        observation = _observe_execution_process_identity(pid, expected_start)
+        if observation["state"] != "dead":
+            continue
+        if launch["state"] == "revoking":
+            terminalized, _task_reclaimed = (
+                _finalize_dead_revoking_launch_locked(
+                    conn,
+                    launch,
+                    observation=observation,
+                )
+            )
+            if terminalized:
+                reconciled += 1
+            continue
+        cur = conn.execute(
+            "UPDATE execution_launches SET state = 'exited', exited_at = ? "
+            "WHERE launch_id = ? AND state = 'started' AND worker_pid = ? "
+            "AND worker_start_time = ?",
+            (
+                int(time.time()), launch["launch_id"], pid, expected_start,
+            ),
+        )
+        if cur.rowcount != 1:
+            continue
+        _append_event(
+            conn,
+            launch["task_id"],
+            "execution_launch_exited",
+            {
+                "launch_id": launch["launch_id"],
+                "pid": pid,
+                "expected_start_time": expected_start,
+                "process_observation": observation,
+                "exit_requested": launch["exit_requested_at"] is not None,
+                "observer_pid": os.getpid(),
+            },
+            run_id=int(launch["run_id"]),
+        )
+        reconciled += 1
+    return reconciled
+
+
+def _finalize_dead_revoking_launch_locked(
+    conn: sqlite3.Connection,
+    launch: sqlite3.Row,
+    *,
+    observation: Mapping[str, Any],
+) -> tuple[bool, bool]:
+    """Finish a dead revocation without overwriting a concurrent outcome.
+
+    Returns ``(launch_terminalized, task_reclaimed)``. A worker may complete,
+    block, or hand off its task while the revoker is terminating the process;
+    its already-ended run remains authoritative and only the launch ledger is
+    finalized in that race.
+    """
+    current = conn.execute(
+        "SELECT * FROM execution_launches WHERE launch_id = ?",
+        (launch["launch_id"],),
+    ).fetchone()
+    if current is None or current["state"] != "revoking":
+        return False, False
+    task = conn.execute(
+        "SELECT status, current_run_id, claim_lock FROM tasks WHERE id = ?",
+        (current["task_id"],),
+    ).fetchone()
+    run = conn.execute(
+        "SELECT ended_at, outcome FROM task_runs WHERE id = ? AND task_id = ?",
+        (int(current["run_id"]), current["task_id"]),
+    ).fetchone()
+    owns_running_task = bool(
+        task is not None
+        and task["status"] == "running"
+        and int(task["current_run_id"] or 0) == int(current["run_id"])
+        and task["claim_lock"] == current["claim_lock"]
+        and run is not None
+        and run["ended_at"] is None
+    )
+    now = int(time.time())
+    if owns_running_task:
+        retry_status = _retry_status_for_run(
+            conn, current["task_id"], int(current["run_id"]),
+        )
+        cur = conn.execute(
+            "UPDATE tasks SET status = ?, claim_lock = NULL, "
+            "claim_expires = NULL, worker_pid = NULL, "
+            "consecutive_failures = 0, last_failure_error = NULL "
+            "WHERE id = ? AND status = 'running' AND current_run_id = ? "
+            "AND claim_lock = ?",
+            (
+                retry_status,
+                current["task_id"],
+                int(current["run_id"]),
+                current["claim_lock"],
+            ),
+        )
+        if cur.rowcount != 1:
+            return False, False
+        run_id = _end_run(
+            conn,
+            current["task_id"],
+            outcome="reclaimed",
+            status="reclaimed",
+            error=f"execution launch revoked: {current['failure_reason'] or ''}",
+            metadata={"process_observation": dict(observation)},
+        )
+        conn.execute(
+            "UPDATE execution_launches SET state = 'revoked', revoked_at = ? "
+            "WHERE launch_id = ? AND state = 'revoking'",
+            (now, current["launch_id"]),
+        )
+        _append_event(
+            conn,
+            current["task_id"],
+            "execution_launch_revoked",
+            {
+                "launch_id": current["launch_id"],
+                "reason": str(current["failure_reason"] or "")[:500],
+                "retry_status": retry_status,
+                "process_observation": dict(observation),
+            },
+            run_id=run_id,
+        )
+        return True, True
+
+    if (
+        task is not None
+        and task["status"] != "running"
+        and run is not None
+        and run["ended_at"] is not None
+    ):
+        cur = conn.execute(
+            "UPDATE execution_launches SET state = 'exited', exited_at = ? "
+            "WHERE launch_id = ? AND state = 'revoking'",
+            (now, current["launch_id"]),
+        )
+        if cur.rowcount != 1:
+            return False, False
+        _append_event(
+            conn,
+            current["task_id"],
+            "execution_launch_terminal_race_preserved",
+            {
+                "launch_id": current["launch_id"],
+                "task_status": task["status"],
+                "run_outcome": run["outcome"],
+                "process_observation": dict(observation),
+            },
+            run_id=int(current["run_id"]),
+        )
+        return True, False
+    return False, False
+
+
+def reconcile_execution_launch_exits(
+    conn: sqlite3.Connection,
+    *,
+    authorization_id: Optional[str] = None,
+) -> int:
+    """Externally certify authorized workers whose exact process is gone."""
+    with _execution_launch_fence(conn):
+        with write_txn(conn):
+            return _reconcile_execution_launch_exits_locked(
+                conn,
+                authorization_id=authorization_id,
+            )
+
+
+def _fail_execution_launch(
+    conn: sqlite3.Connection,
+    task: Task,
+    reason: str,
+    *,
+    confirmed_exit_pid: Optional[int] = None,
+) -> None:
+    if not task.execution_launch_id:
+        return
+    with _execution_launch_fence(conn):
+        with write_txn(conn):
+            launch = conn.execute(
+                "SELECT * FROM execution_launches WHERE launch_id = ?",
+                (task.execution_launch_id,),
+            ).fetchone()
+            if launch is None or launch["state"] in {"exited", "revoked", "failed"}:
+                return
+            if confirmed_exit_pid is not None:
+                # This proof comes only from waiting on the exact Popen handle
+                # returned by the spawn call, or from exact durable birth-time
+                # termination. Do not re-query the PID here: it may already
+                # have been reused by an unrelated process.
+                if (
+                    launch["worker_pid"] is not None
+                    and int(launch["worker_pid"]) != int(confirmed_exit_pid)
+                ):
+                    raise ExecutionAdmissionError(
+                        "confirmed process exit does not match execution launch"
+                    )
+                if launch["worker_pid"] is None:
+                    conn.execute(
+                        "UPDATE execution_launches SET worker_pid = ?, "
+                        "pid_registered_at = COALESCE(pid_registered_at, ?) "
+                        "WHERE launch_id = ? AND worker_pid IS NULL",
+                        (
+                            int(confirmed_exit_pid),
+                            int(time.time()),
+                            task.execution_launch_id,
+                        ),
+                    )
+            elif launch["state"] != "reserved" or launch["worker_pid"] is not None:
+                # Only a never-spawned reservation is intrinsically safe to
+                # fail. Once spawning begins, missing PID/birth information is
+                # uncertainty and must retain the one-shot ownership barrier.
+                raise ExecutionAdmissionError(
+                    "cannot fail an execution launch without exact process-exit proof"
+                )
+            conn.execute(
+                "UPDATE execution_launches SET state = 'failed', "
+                "failure_reason = ?, revoked_at = ? WHERE launch_id = ?",
+                (str(reason)[:2000], int(time.time()), task.execution_launch_id),
+            )
+            _append_event(
+                conn,
+                task.id,
+                "execution_launch_failed",
+                {"launch_id": task.execution_launch_id, "reason": str(reason)[:500]},
+                run_id=task.current_run_id,
+            )
 
 
 def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
@@ -10462,6 +11904,212 @@ def check_respawn_guard(
             return "active_pr"
 
     return None
+
+
+def _call_spawn(
+    spawn,
+    task: Task,
+    workspace: str,
+    *,
+    board: Optional[str],
+    execution_launch: Optional[Mapping[str, str]] = None,
+):
+    """Invoke a spawn hook while preserving older non-admission test hooks."""
+    import inspect
+
+    kwargs: dict[str, Any] = {}
+    try:
+        sig = inspect.signature(spawn)
+        if "board" in sig.parameters:
+            kwargs["board"] = board
+        if "execution_launch" in sig.parameters:
+            kwargs["execution_launch"] = execution_launch
+        elif execution_launch is not None:
+            raise ExecutionAdmissionError(
+                "admitted spawn hook does not implement the startup handshake"
+            )
+        return spawn(task, workspace, **kwargs)
+    except (TypeError, ValueError) as exc:
+        if execution_launch is not None:
+            raise ExecutionAdmissionError(
+                "admitted spawn hook cannot be safely inspected"
+            ) from exc
+        return spawn(task, workspace)
+
+
+def _wait_for_exact_spawned_process_exit(
+    handle: SpawnedWorker,
+    *,
+    timeout: float = 2.0,
+) -> bool:
+    """Use only the retained Popen handle to prove this child exited."""
+    process = handle.process
+    if process is None:
+        return False
+    try:
+        process.wait(timeout=timeout)
+    except Exception:
+        return False
+    return process.poll() is not None
+
+
+def _spawn_claimed_task(
+    conn: sqlite3.Connection,
+    task: Task,
+    workspace: str,
+    *,
+    board: Optional[str],
+    spawn_fn=None,
+) -> Optional[int]:
+    """Launch a claimed task, fencing admitted workers through PID startup."""
+    spawn = spawn_fn if spawn_fn is not None else _default_spawn
+    if not task.execution_launch_id:
+        live_admission = _live_execution_admission(conn)
+        durable_launch = _execution_launch_row(
+            conn,
+            task.id,
+            run_id=task.current_run_id,
+        )
+        if live_admission is not None or durable_launch is not None:
+            detail = (
+                f"live admission {live_admission['authorization_id']}:"
+                f"{live_admission['state']}"
+                if live_admission is not None
+                else f"durable launch {durable_launch['launch_id']}:"
+                f"{durable_launch['state']}"
+            )
+            raise ExecutionAdmissionError(
+                "claimed task is missing its one-use execution launch "
+                f"capability ({detail})"
+            )
+        raw = _call_spawn(spawn, task, workspace, board=board)
+        pid = int(raw.pid) if isinstance(raw, SpawnedWorker) else (int(raw) if raw else None)
+        if pid:
+            _set_worker_pid(conn, task.id, pid)
+        return pid
+
+    if (
+        not task.execution_launch_nonce
+        or not task.execution_launch_db_path
+        or task.execution_launch_lane not in {"ready", "review"}
+    ):
+        raise ExecutionAdmissionError(
+            "claimed task execution launch capability is incomplete"
+        )
+    durable_launch = _execution_launch_row(
+        conn,
+        task.id,
+        run_id=task.current_run_id,
+    )
+    if (
+        durable_launch is None
+        or durable_launch["launch_id"] != task.execution_launch_id
+    ):
+        raise ExecutionAdmissionError(
+            "claimed task execution launch capability does not match the ledger"
+        )
+
+    launch_context = {
+        "launch_id": task.execution_launch_id,
+        "db_path": task.execution_launch_db_path or "",
+    }
+    handle: Optional[SpawnedWorker] = None
+    try:
+        # The fence covers the final claim/admission/identity revalidation,
+        # subprocess creation, and exact PID publication. A concurrent reclaim
+        # or seal cannot slip between those phases.
+        with _execution_launch_fence(conn):
+            _mark_execution_launch_spawning(conn, task, workspace)
+            raw = _call_spawn(
+                spawn,
+                task,
+                workspace,
+                board=board,
+                execution_launch=launch_context,
+            )
+            if not isinstance(raw, SpawnedWorker) or raw.startup_writer is None:
+                raise ExecutionAdmissionError(
+                    "admitted spawn did not return a private startup channel"
+                )
+            handle = raw
+            _set_worker_pid(
+                conn,
+                task.id,
+                int(handle.pid),
+                expected_run_id=task.current_run_id,
+                expected_claim_lock=task.claim_lock,
+                execution_launch_id=task.execution_launch_id,
+            )
+
+        # Do not hold the board fence while the child consumes the capability.
+        # If a reclaimer wins now it revokes the row first; the child's CAS
+        # then fails before plugins, inference, or tools can start.
+        secret_payload = json.dumps(
+            {
+                "launch_id": task.execution_launch_id,
+                "nonce": task.execution_launch_nonce,
+            },
+            separators=(",", ":"),
+        ).encode("utf-8") + b"\n"
+        handle.startup_writer.write(secret_payload)
+        handle.startup_writer.flush()
+        handle.startup_writer.close()
+        handle.startup_writer = None
+        task.execution_launch_nonce = None
+        return int(handle.pid)
+    except Exception:
+        if handle is not None and handle.startup_writer is not None:
+            try:
+                handle.startup_writer.close()
+            except Exception:
+                pass
+        confirmed_exit_pid: Optional[int] = None
+        if handle is not None and _wait_for_exact_spawned_process_exit(handle):
+            confirmed_exit_pid = int(handle.pid)
+        elif handle is not None:
+            # Use only the process identity already written by the successful
+            # PID-registration CAS. Never turn a fresh lookup (or a missing
+            # birth marker) into authority to signal this PID.
+            launch = conn.execute(
+                "SELECT worker_pid, worker_start_time FROM execution_launches "
+                "WHERE launch_id = ?",
+                (task.execution_launch_id,),
+            ).fetchone()
+            if (
+                launch is not None
+                and launch["worker_pid"] is not None
+                and int(launch["worker_pid"]) == int(handle.pid)
+                and launch["worker_start_time"] is not None
+            ):
+                termination = _terminate_execution_worker(
+                    int(handle.pid),
+                    task.claim_lock,
+                    expected_start_time=int(launch["worker_start_time"]),
+                )
+                if termination.get("terminated"):
+                    confirmed_exit_pid = int(handle.pid)
+        if confirmed_exit_pid is not None:
+            try:
+                _fail_execution_launch(
+                    conn,
+                    task,
+                    "spawn/startup handshake failed",
+                    confirmed_exit_pid=confirmed_exit_pid,
+                )
+            except Exception:
+                _log.exception(
+                    "failed to close execution launch %s",
+                    task.execution_launch_id,
+                )
+        elif handle is None:
+            # The spawn callback may have raised after creating a child but
+            # before returning its exact handle. Leave `spawning` held; a
+            # missing callback result is never proof that no process exists.
+            _log.error(
+                "execution launch %s remains held after an unproven spawn failure",
+                task.execution_launch_id,
+            )
+        raise
 
 
 def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
@@ -10768,28 +12416,10 @@ def dispatch_once(
     boards tick in parallel. See :func:`_dispatch_tick_lock` for the
     cross-process / cross-platform mechanics.
     """
-    try:
-        db_path = kanban_db_path(board=board)
-    except Exception:
-        # Path resolution should never fail, but if it somehow does we
-        # must not lose the tick — fall through to an unguarded dispatch
-        # rather than dropping work.
-        result = _dispatch_once_locked(
-            conn,
-            spawn_fn=spawn_fn,
-            ttl_seconds=ttl_seconds,
-            dry_run=dry_run,
-            max_spawn=max_spawn,
-            max_in_progress=max_in_progress,
-            failure_limit=failure_limit,
-            stale_timeout_seconds=stale_timeout_seconds,
-            board=board,
-            default_assignee=default_assignee,
-            max_in_progress_per_profile=max_in_progress_per_profile,
-            reconcile_orphans=reconcile_orphans,
-        )
-        _fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
-        return result
+    # Derive the lock from the live connection. A stale/mistyped ``board``
+    # argument must never let two processes lock different files while writing
+    # the same SQLite database.
+    db_path = _connection_db_path(conn)
     with _dispatch_tick_lock(db_path) as held:
         if not held:
             result = DispatchResult(skipped_locked=True)
@@ -10873,6 +12503,10 @@ def _dispatch_once_locked(
     # Reap zombie children from previously spawned workers. See
     # reap_worker_zombies() for the full rationale.
     reap_worker_zombies()
+    # A child may only request exit; it cannot certify its own death. Observe
+    # all durable started launches before task-status reconciliation so even a
+    # worker that already completed/blocked its task can be finalized safely.
+    reconcile_execution_launch_exits(conn)
 
     result = DispatchResult()
     result.reclaimed = release_stale_claims(conn)
@@ -11186,6 +12820,13 @@ def _dispatch_once_locked(
             else:
                 workspace = resolve_workspace(claimed, board=board)
         except Exception as exc:
+            if claimed.execution_launch_id:
+                try:
+                    _fail_execution_launch(conn, claimed, f"workspace: {exc}")
+                except Exception:
+                    _log.exception(
+                        "failed to close execution launch after workspace error"
+                    )
             auto = _record_spawn_failure(
                 conn, claimed.id, f"workspace: {exc}",
                 failure_limit=failure_limit,
@@ -11198,22 +12839,14 @@ def _dispatch_once_locked(
         if claimed.workspace_kind == "worktree":
             set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
-        _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
-            # Back-compat: older spawn_fn signatures accept only
-            # (task, workspace). Test stubs in the suite rely on that.
-            # Introspect the callable and pass `board` only when supported.
-            import inspect
-            try:
-                sig = inspect.signature(_spawn)
-                if "board" in sig.parameters:
-                    pid = _spawn(claimed, str(workspace), board=board)
-                else:
-                    pid = _spawn(claimed, str(workspace))
-            except (TypeError, ValueError):
-                pid = _spawn(claimed, str(workspace))
-            if pid:
-                _set_worker_pid(conn, claimed.id, int(pid))
+            pid = _spawn_claimed_task(
+                conn,
+                claimed,
+                str(workspace),
+                board=board,
+                spawn_fn=spawn_fn,
+            )
             # Worker-lifecycle observer (RFC #58548): fires AFTER spawn_fn
             # returned and the PID (when reported) is durably persisted,
             # per the RFC timing contract. Best-effort — can never break
@@ -11238,6 +12871,18 @@ def _dispatch_once_locked(
                     _per_profile_running.get(claimed.assignee, 0) + 1
                 )
         except Exception as exc:
+            launch = (
+                _execution_launch_row(conn, claimed.id, run_id=claimed.current_run_id)
+                if claimed.execution_launch_id else None
+            )
+            if launch is not None and launch["state"] in {
+                "reserved", "spawning", "started", "revoking",
+            }:
+                _log.error(
+                    "admitted worker launch %s remains held after spawn failure: %s",
+                    launch["launch_id"], exc,
+                )
+                continue
             auto = _record_spawn_failure(
                 conn, claimed.id, str(exc),
                 failure_limit=failure_limit,
@@ -11329,6 +12974,13 @@ def _dispatch_once_locked(
             else:
                 workspace = resolve_workspace(claimed, board=board)
         except Exception as exc:
+            if claimed.execution_launch_id:
+                try:
+                    _fail_execution_launch(conn, claimed, f"workspace: {exc}")
+                except Exception:
+                    _log.exception(
+                        "failed to close review execution launch after workspace error"
+                    )
             auto = _record_spawn_failure(
                 conn, claimed.id, f"workspace: {exc}",
                 failure_limit=failure_limit,
@@ -11349,19 +13001,14 @@ def _dispatch_once_locked(
         claimed.skills = list(
             dict.fromkeys([*(claimed.skills or []), "sdlc-review"])
         )
-        _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
-            import inspect
-            try:
-                sig = inspect.signature(_spawn)
-                if "board" in sig.parameters:
-                    pid = _spawn(claimed, str(workspace), board=board)
-                else:
-                    pid = _spawn(claimed, str(workspace))
-            except (TypeError, ValueError):
-                pid = _spawn(claimed, str(workspace))
-            if pid:
-                _set_worker_pid(conn, claimed.id, int(pid))
+            pid = _spawn_claimed_task(
+                conn,
+                claimed,
+                str(workspace),
+                board=board,
+                spawn_fn=spawn_fn,
+            )
             # Worker-lifecycle observer (RFC #58548): same contract as the
             # ready-lane fire above — after spawn + PID persistence.
             _fire_worker_spawned_hook(
@@ -11374,6 +13021,18 @@ def _dispatch_once_locked(
                     _per_profile_running.get(claimed.assignee, 0) + 1
                 )
         except Exception as exc:
+            launch = (
+                _execution_launch_row(conn, claimed.id, run_id=claimed.current_run_id)
+                if claimed.execution_launch_id else None
+            )
+            if launch is not None and launch["state"] in {
+                "reserved", "spawning", "started", "revoking",
+            }:
+                _log.error(
+                    "admitted review launch %s remains held after spawn failure: %s",
+                    launch["launch_id"], exc,
+                )
+                continue
             auto = _record_spawn_failure(
                 conn, claimed.id, str(exc),
                 failure_limit=failure_limit,
@@ -11724,7 +13383,8 @@ def _default_spawn(
     workspace: str,
     *,
     board: Optional[str] = None,
-) -> Optional[int]:
+    execution_launch: Optional[Mapping[str, str]] = None,
+) -> Optional[int | SpawnedWorker]:
     """Fire-and-forget ``hermes -p <profile> chat -q ...`` subprocess.
 
     Returns the spawned child's PID so the dispatcher can detect crashes
@@ -11740,6 +13400,61 @@ def _default_spawn(
     import subprocess
     if not task.assignee:
         raise ValueError(f"task {task.id} has no assignee")
+    if execution_launch is not None:
+        launch_id = str(execution_launch.get("launch_id") or "")
+        launch_db_path = str(execution_launch.get("db_path") or "")
+        if (
+            not launch_id
+            or not launch_db_path
+            or launch_id != task.execution_launch_id
+            or launch_db_path != task.execution_launch_db_path
+        ):
+            raise ExecutionAdmissionError(
+                "execution launch spawn context mismatch"
+            )
+        with connect_closing(db_path=Path(launch_db_path)) as policy_conn:
+            durable_launch = policy_conn.execute(
+                "SELECT * FROM execution_launches WHERE launch_id = ?",
+                (launch_id,),
+            ).fetchone()
+            if durable_launch is None:
+                raise ExecutionAdmissionError(
+                    "execution launch missing before subprocess creation"
+                )
+            _validate_launch_binding(
+                policy_conn,
+                durable_launch,
+                require_state={"spawning"},
+                workspace=workspace,
+            )
+            if (
+                durable_launch["task_id"] != task.id
+                or int(durable_launch["run_id"])
+                != int(task.current_run_id or 0)
+                or durable_launch["claim_lock"] != task.claim_lock
+            ):
+                raise ExecutionAdmissionError(
+                    "execution launch durable spawn binding mismatch"
+                )
+    else:
+        if task.execution_launch_id:
+            raise ExecutionAdmissionError(
+                "execution launch context was dropped before subprocess creation"
+            )
+        # Defense in depth for callers that bypass `_spawn_claimed_task`: the
+        # durable board, not ephemeral Task fields, decides whether the legacy
+        # subprocess path is allowed.
+        with connect_closing(db_path=kanban_db_path(board=board)) as policy_conn:
+            live_admission = _live_execution_admission(policy_conn)
+            durable_launch = _execution_launch_row(
+                policy_conn,
+                task.id,
+                run_id=task.current_run_id,
+            )
+            if live_admission is not None or durable_launch is not None:
+                raise ExecutionAdmissionError(
+                    "durable execution policy refuses an unguarded subprocess"
+                )
 
     from hermes_cli.profiles import normalize_profile_name
 
@@ -11835,7 +13550,12 @@ def _default_spawn(
     # dispatcher's. Belt-and-braces with the `get_default_hermes_root()`
     # resolution in `kanban_home()` — symmetric resolution is the norm,
     # but unusual symlink / Docker layouts are caught here too.
-    env["HERMES_KANBAN_DB"] = str(kanban_db_path(board=board))
+    if execution_launch is not None:
+        launch_db_path = str(execution_launch.get("db_path") or "")
+        env["HERMES_KANBAN_DB"] = launch_db_path
+        env["HERMES_KANBAN_LAUNCH_REQUIRED"] = "1"
+    else:
+        env["HERMES_KANBAN_DB"] = str(kanban_db_path(board=board))
     env["HERMES_KANBAN_WORKSPACES_ROOT"] = str(workspaces_root(board=board))
     _retag_legacy_worker_sessions(env["HERMES_KANBAN_WORKSPACES_ROOT"])
     # Board slug — the final defense-in-depth pin. If the worker ever
@@ -11904,10 +13624,13 @@ def _default_spawn(
         # protocol violation (incident 2026-06-09 t_d9cbe312).
         cmd.append("-Q")
 
-    # A worker spawned by a managed systemd gateway must leave the gateway's
-    # cgroup before startup; otherwise restarting the service kills the worker
-    # that is performing the handoff.
-    cmd = _restart_safe_worker_argv(task, cmd)
+    # A worker spawned by a managed systemd gateway normally leaves the
+    # gateway's cgroup. An execution-admitted launch deliberately stays a
+    # direct child: PID publication and child-side authorization must name the
+    # same process object. A gateway restart may kill it, which is safe and is
+    # reconciled as a failed one-shot run; substituting a wrapper PID is not.
+    if execution_launch is None:
+        cmd = _restart_safe_worker_argv(task, cmd)
 
     # Redirect output to a per-task log under <board-root>/logs/.
     # Anchored at the board root (not the shared kanban root), so
@@ -11925,7 +13648,10 @@ def _default_spawn(
         proc = subprocess.Popen(  # noqa: S603 -- argv is a fixed list built above
             cmd,
             cwd=workspace if os.path.isdir(workspace) else None,
-            stdin=subprocess.DEVNULL,
+            # An admitted child starts as a waiting bootstrap. The parent
+            # writes its one-use secret only after the exact PID and process
+            # birth marker are durably registered under the board fence.
+            stdin=(subprocess.PIPE if execution_launch is not None else subprocess.DEVNULL),
             stdout=log_f,
             stderr=subprocess.STDOUT,
             env=env,
@@ -11943,6 +13669,14 @@ def _default_spawn(
     # handle is kept alive by the child's inheritance.  The parent's
     # reference goes out of scope and is GC'd, but the OS-level FD stays
     # open in the child until the child exits.
+    if execution_launch is not None:
+        if proc.stdin is None:  # pragma: no cover - subprocess invariant
+            raise ExecutionAdmissionError("execution launch startup pipe missing")
+        return SpawnedWorker(
+            pid=int(proc.pid),
+            startup_writer=proc.stdin,
+            process=proc,
+        )
     return proc.pid
 
 

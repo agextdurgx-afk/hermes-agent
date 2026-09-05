@@ -61,6 +61,15 @@ try:
 except ModuleNotFoundError:
     pass
 
+# An execution-admitted Kanban child must consume its one-use, PID-bound
+# startup capability before this module imports plugin, MCP, hook, provider, or
+# agent startup surfaces. This check is unconditional so deleting only the
+# marker cannot turn governed work into an ordinary unguarded worker.
+from hermes_cli.kanban_launch import require_execution_launch as _require_execution_launch
+
+_require_execution_launch()
+del _require_execution_launch
+
 # Windows: neutralize CPython's ``platform._syscmd_ver`` before anything else
 # imports — it shells out ``cmd /c ver`` (shell=True, no CREATE_NO_WINDOW), so
 # any dependency touching ``platform.uname()`` at import time flashes a
@@ -142,6 +151,12 @@ def _exit_after_oneshot(rc: object) -> None:
     be the abort source. Stateful cleanup is handled in ``_run_agent`` and
     ``_cleanup_oneshot_runtime``.
     """
+    try:
+        from hermes_cli.kanban_launch import finish_execution_launch
+
+        finish_execution_launch()
+    except Exception:
+        pass
     for stream in (sys.stdout, sys.stderr):
         try:
             stream.flush()

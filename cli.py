@@ -23,6 +23,15 @@ except ModuleNotFoundError:
     # means UTF-8 stdio setup is skipped on Windows; POSIX is unaffected.
     pass
 
+# Direct ``python cli.py`` is a supported entrypoint. Apply the same durable
+# board check before importing CLI mixins, prompt-toolkit, tool registries,
+# providers, or agent code. The unconditional call prevents a stripped marker
+# from downgrading admitted work to the legacy path.
+from hermes_cli.kanban_launch import require_execution_launch as _require_execution_launch
+
+_require_execution_launch()
+del _require_execution_launch
+
 import logging
 import copy
 import os

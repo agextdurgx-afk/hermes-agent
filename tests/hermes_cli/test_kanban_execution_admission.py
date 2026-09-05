@@ -5,7 +5,12 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import json
+import os
+import sqlite3
+import subprocess
+import sys
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -44,6 +49,8 @@ def _task(conn, title: str, *, no_agent: bool = False) -> str:
         if no_agent
         else f"Run one governed worker: {title}"
     )
+    workspace = Path(conn.execute("PRAGMA database_list").fetchone()[2]).parent / "workspace"
+    workspace.mkdir(parents=True, exist_ok=True)
     return kb.create_task(
         conn,
         title=title,
@@ -51,7 +58,7 @@ def _task(conn, title: str, *, no_agent: bool = False) -> str:
         assignee="governed-worker",
         created_by="coordinator",
         workspace_kind="dir",
-        workspace_path="/tmp/governed-workspace",
+        workspace_path=str(workspace),
         idempotency_key=f"admission:{title}",
         max_runtime_seconds=900,
         max_retries=1,
@@ -79,6 +86,47 @@ def _activate(conn, policy_sha256):
         generation=GENERATION,
         policy_sha256=policy_sha256,
     )
+
+
+def _activate_one_worker(conn, title="collector", *, lane="ready"):
+    _begin(conn)
+    worker = _task(conn, title)
+    bound = _bind(conn, [{
+        "task_id": worker,
+        "execution_kind": "worker",
+        "allowed_claim_status": lane,
+    }])
+    _activate(conn, bound["policy_sha256"])
+    if lane == "ready":
+        assert kb.unblock_task(conn, worker)
+    else:
+        conn.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (worker,))
+        conn.commit()
+    return worker, bound
+
+
+def test_existing_launch_ledger_adds_exit_request_column(tmp_path):
+    db_path = tmp_path / "legacy-launch.db"
+    legacy_schema = kb.SCHEMA_SQL.replace(
+        "    exit_requested_at  INTEGER,\n",
+        "",
+    )
+    assert legacy_schema != kb.SCHEMA_SQL
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.executescript(legacy_schema)
+    finally:
+        conn.close()
+    kb.init_db(db_path=db_path)
+    conn = sqlite3.connect(db_path)
+    try:
+        columns = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(execution_launches)")
+        }
+    finally:
+        conn.close()
+    assert "exit_requested_at" in columns
 
 
 def test_begin_is_deny_all_and_exact_replay_is_idempotent(kanban_home):
@@ -255,9 +303,18 @@ def test_board_global_dispatch_spawns_only_the_authorized_worker(
 
         spawned: list[str] = []
 
-        def spawn(task, _workspace, **_kwargs):
+        class _Writer:
+            def write(self, _payload):
+                return None
+            def flush(self):
+                return None
+            def close(self):
+                return None
+
+        def spawn(task, _workspace, *, execution_launch=None, **_kwargs):
+            assert execution_launch is not None
             spawned.append(task.id)
-            return None
+            return kb.SpawnedWorker(pid=__import__("os").getpid(), startup_writer=_Writer())
 
         live = kb.dispatch_once(conn, spawn_fn=spawn)
         assert spawned == [worker]
@@ -422,6 +479,986 @@ def test_execution_admission_is_scoped_to_one_board_database(tmp_path):
     with kb.connect(second_path) as second:
         task = kb.create_task(second, title="independent", assignee="worker")
         assert kb.claim_task(second, task, claimer="test:other-board") is not None
+
+
+@pytest.mark.parametrize("lane", ["ready", "review"])
+def test_reclaim_during_workspace_resolution_prevents_ready_and_review_spawn(
+    kanban_home, monkeypatch, lane,
+):
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
+    with kb.connect() as conn:
+        worker, _bound = _activate_one_worker(conn, f"race-{lane}", lane=lane)
+        real_workspace = kb.resolve_workspace
+        spawned = []
+
+        def reclaim_while_resolving(task, *, board=None):
+            with kb.connect() as other:
+                assert kb.reclaim_task(other, task.id, reason="race probe")
+            return real_workspace(task, board=board)
+
+        def spawn(*_args, **_kwargs):
+            spawned.append(True)
+            raise AssertionError("revoked launch reached subprocess creation")
+
+        monkeypatch.setattr(kb, "resolve_workspace", reclaim_while_resolving)
+        result = kb.dispatch_once(conn, spawn_fn=spawn)
+        assert result.spawned == []
+        assert spawned == []
+        launch = conn.execute(
+            "SELECT state FROM execution_launches WHERE task_id = ?", (worker,)
+        ).fetchone()
+        assert launch["state"] == "revoked"
+
+
+def test_claim_reserves_bound_one_use_launch_without_plaintext_secret(kanban_home):
+    with kb.connect() as conn:
+        worker, bound = _activate_one_worker(conn)
+        claimed = kb.claim_task(conn, worker, claimer=f"{kb._claimer_id().split(':', 1)[0]}:test")
+        assert claimed is not None
+        assert claimed.execution_launch_id
+        assert claimed.execution_launch_nonce
+        row = conn.execute(
+            "SELECT * FROM execution_launches WHERE launch_id = ?",
+            (claimed.execution_launch_id,),
+        ).fetchone()
+        assert row["state"] == "reserved"
+        assert row["authorization_id"] == AUTH
+        assert row["generation"] == GENERATION
+        assert row["policy_sha256"] == bound["policy_sha256"]
+        assert row["task_id"] == worker
+        assert row["run_id"] == claimed.current_run_id
+        assert row["claim_lock"] == claimed.claim_lock
+        assert row["board_db_path"] == str(kb._connection_db_path(conn))
+        assert claimed.execution_launch_nonce not in json.dumps(dict(row))
+
+
+def test_failed_process_termination_keeps_launch_and_claim_held(kanban_home):
+    with kb.connect() as conn:
+        worker, bound = _activate_one_worker(conn)
+        local_lock = f"{kb._claimer_id().split(':', 1)[0]}:termination-test"
+        claimed = kb.claim_task(conn, worker, claimer=local_lock)
+        assert claimed is not None
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            stdin=subprocess.PIPE,
+        )
+        try:
+            with kb._execution_launch_fence(conn):
+                kb._mark_execution_launch_spawning(
+                    conn, claimed, str(Path(claimed.workspace_path)),
+                )
+                kb._set_worker_pid(
+                    conn,
+                    worker,
+                    proc.pid,
+                    expected_run_id=claimed.current_run_id,
+                    expected_claim_lock=claimed.claim_lock,
+                    execution_launch_id=claimed.execution_launch_id,
+                )
+
+            def denied(_pid, _sig):
+                raise PermissionError("denied")
+
+            assert kb.reclaim_task(
+                conn, worker, reason="termination probe", signal_fn=denied,
+            ) is False
+            assert kb.get_task(conn, worker).status == "running"
+            launch = conn.execute(
+                "SELECT state FROM execution_launches WHERE task_id = ?", (worker,)
+            ).fetchone()
+            assert launch["state"] == "revoking"
+            with pytest.raises(kb.ExecutionAdmissionError, match="cannot seal"):
+                kb.seal_execution_admission(
+                    conn,
+                    authorization_id=AUTH,
+                    generation=GENERATION,
+                    policy_sha256=bound["policy_sha256"],
+                    reason="must retain uncertain process ownership",
+                )
+        finally:
+            proc.terminate()
+            proc.wait(timeout=10)
+            assert kb.reclaim_task(conn, worker, reason="test cleanup")
+
+
+def test_pid_bound_nonce_is_single_use_and_rejects_wrong_token(kanban_home):
+    with kb.connect() as conn:
+        worker, _bound = _activate_one_worker(conn)
+        local_lock = f"{kb._claimer_id().split(':', 1)[0]}:consume-test"
+        claimed = kb.claim_task(conn, worker, claimer=local_lock)
+        assert claimed is not None
+        with kb._execution_launch_fence(conn):
+            kb._mark_execution_launch_spawning(
+                conn, claimed, str(Path(claimed.workspace_path)),
+            )
+            kb._set_worker_pid(
+                conn,
+                worker,
+                os.getpid(),
+                expected_run_id=claimed.current_run_id,
+                expected_claim_lock=claimed.claim_lock,
+                execution_launch_id=claimed.execution_launch_id,
+            )
+        with pytest.raises(kb.ExecutionAdmissionError, match="startup proof"):
+            kb.consume_execution_launch(
+                conn,
+                launch_id=claimed.execution_launch_id,
+                nonce="wrong",
+                task_id=worker,
+                run_id=claimed.current_run_id,
+                claim_lock=claimed.claim_lock,
+                worker_pid=os.getpid(),
+            )
+        started = kb.consume_execution_launch(
+            conn,
+            launch_id=claimed.execution_launch_id,
+            nonce=claimed.execution_launch_nonce,
+            task_id=worker,
+            run_id=claimed.current_run_id,
+            claim_lock=claimed.claim_lock,
+            worker_pid=os.getpid(),
+        )
+        assert started["launch_id"] == claimed.execution_launch_id
+        with pytest.raises(kb.ExecutionAdmissionError, match="expected"):
+            kb.consume_execution_launch(
+                conn,
+                launch_id=claimed.execution_launch_id,
+                nonce=claimed.execution_launch_nonce,
+                task_id=worker,
+                run_id=claimed.current_run_id,
+                claim_lock=claimed.claim_lock,
+                worker_pid=os.getpid(),
+            )
+        assert kb.finish_execution_launch(
+            conn, launch_id=claimed.execution_launch_id, worker_pid=os.getpid(),
+        )
+        launch = conn.execute(
+            "SELECT state, exit_requested_at, exited_at FROM execution_launches "
+            "WHERE launch_id = ?",
+            (claimed.execution_launch_id,),
+        ).fetchone()
+        assert launch["state"] == "started"
+        assert launch["exit_requested_at"] is not None
+        assert launch["exited_at"] is None
+        assert kb.reconcile_execution_launch_exits(conn) == 0
+
+
+def test_boolean_liveness_failure_cannot_certify_process_death(
+    kanban_home, monkeypatch,
+):
+    with kb.connect() as conn:
+        worker, bound = _activate_one_worker(conn, "tri-state-observer")
+        claimed = kb.claim_task(conn, worker, claimer="tri-state:observer")
+        assert claimed is not None
+        with kb._execution_launch_fence(conn):
+            kb._mark_execution_launch_spawning(
+                conn, claimed, str(Path(claimed.workspace_path)),
+            )
+            kb._set_worker_pid(
+                conn,
+                worker,
+                os.getpid(),
+                expected_run_id=claimed.current_run_id,
+                expected_claim_lock=claimed.claim_lock,
+                execution_launch_id=claimed.execution_launch_id,
+            )
+        kb.consume_execution_launch(
+            conn,
+            launch_id=claimed.execution_launch_id,
+            nonce=claimed.execution_launch_nonce,
+            task_id=worker,
+            run_id=claimed.current_run_id,
+            claim_lock=claimed.claim_lock,
+            worker_pid=os.getpid(),
+        )
+        assert kb.finish_execution_launch(
+            conn,
+            launch_id=claimed.execution_launch_id,
+            worker_pid=os.getpid(),
+        )
+        monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+        assert kb.reconcile_execution_launch_exits(conn) == 0
+        assert conn.execute(
+            "SELECT state FROM execution_launches WHERE launch_id = ?",
+            (claimed.execution_launch_id,),
+        ).fetchone()["state"] == "started"
+        with pytest.raises(kb.ExecutionAdmissionError, match="cannot seal"):
+            kb.seal_execution_admission(
+                conn,
+                authorization_id=AUTH,
+                generation=GENERATION,
+                policy_sha256=bound["policy_sha256"],
+                reason="boolean liveness failure is unknown",
+            )
+
+
+def test_process_observer_uses_registration_birth_marker_representation():
+    expected = kb._worker_process_start_time(os.getpid())
+    assert expected is not None
+    observation = kb._observe_execution_process_identity(
+        os.getpid(), expected,
+    )
+    assert observation["state"] == "alive"
+    assert observation["observed_start_time"] == expected
+
+
+@pytest.mark.parametrize("wrong_field", ["task", "run", "claim"])
+def test_startup_authorization_rejects_wrong_claim_binding(
+    kanban_home, wrong_field,
+):
+    with kb.connect() as conn:
+        worker, _bound = _activate_one_worker(conn, f"wrong-{wrong_field}")
+        local_lock = f"{kb._claimer_id().split(':', 1)[0]}:wrong-{wrong_field}"
+        claimed = kb.claim_task(conn, worker, claimer=local_lock)
+        assert claimed is not None
+        with kb._execution_launch_fence(conn):
+            kb._mark_execution_launch_spawning(
+                conn, claimed, str(Path(claimed.workspace_path)),
+            )
+            kb._set_worker_pid(
+                conn,
+                worker,
+                os.getpid(),
+                expected_run_id=claimed.current_run_id,
+                expected_claim_lock=claimed.claim_lock,
+                execution_launch_id=claimed.execution_launch_id,
+            )
+        values = {
+            "task_id": worker,
+            "run_id": claimed.current_run_id,
+            "claim_lock": claimed.claim_lock,
+        }
+        if wrong_field == "task":
+            values["task_id"] = "t_wrong"
+        elif wrong_field == "run":
+            values["run_id"] += 1
+        else:
+            values["claim_lock"] += "-wrong"
+        with pytest.raises(kb.ExecutionAdmissionError, match="startup proof"):
+            kb.consume_execution_launch(
+                conn,
+                launch_id=claimed.execution_launch_id,
+                nonce=claimed.execution_launch_nonce,
+                worker_pid=os.getpid(),
+                **values,
+            )
+
+
+def test_only_one_concurrent_startup_consumer_can_win(kanban_home):
+    with kb.connect() as conn:
+        worker, _bound = _activate_one_worker(conn, "concurrent-consumer")
+        local_lock = f"{kb._claimer_id().split(':', 1)[0]}:concurrent"
+        claimed = kb.claim_task(conn, worker, claimer=local_lock)
+        assert claimed is not None
+        with kb._execution_launch_fence(conn):
+            kb._mark_execution_launch_spawning(
+                conn, claimed, str(Path(claimed.workspace_path)),
+            )
+            kb._set_worker_pid(
+                conn,
+                worker,
+                os.getpid(),
+                expected_run_id=claimed.current_run_id,
+                expected_claim_lock=claimed.claim_lock,
+                execution_launch_id=claimed.execution_launch_id,
+            )
+
+    barrier = threading.Barrier(2)
+
+    def consume():
+        with kb.connect() as other:
+            barrier.wait(timeout=5)
+            try:
+                kb.consume_execution_launch(
+                    other,
+                    launch_id=claimed.execution_launch_id,
+                    nonce=claimed.execution_launch_nonce,
+                    task_id=worker,
+                    run_id=claimed.current_run_id,
+                    claim_lock=claimed.claim_lock,
+                    worker_pid=os.getpid(),
+                )
+                return "started"
+            except kb.ExecutionAdmissionError:
+                return "refused"
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        outcomes = list(pool.map(lambda _index: consume(), range(2)))
+    assert sorted(outcomes) == ["refused", "started"]
+
+    with kb.connect() as conn:
+        assert kb.finish_execution_launch(
+            conn, launch_id=claimed.execution_launch_id, worker_pid=os.getpid(),
+        )
+
+
+@pytest.mark.parametrize(
+    ("column", "value"),
+    [
+        ("body", "changed after claim"),
+        ("model_override", "different-model"),
+        ("workspace_path", "/tmp/different-workspace"),
+    ],
+)
+def test_launch_revalidates_identity_after_claim(
+    kanban_home, column, value,
+):
+    with kb.connect() as conn:
+        worker, _bound = _activate_one_worker(conn, f"drift-{column}")
+        claimed = kb.claim_task(conn, worker, claimer="identity:drift")
+        assert claimed is not None
+        conn.execute(f"UPDATE tasks SET {column} = ? WHERE id = ?", (value, worker))
+        conn.commit()
+        with kb._execution_launch_fence(conn):
+            with pytest.raises(kb.ExecutionAdmissionError, match="identity|workspace"):
+                kb._mark_execution_launch_spawning(
+                    conn, claimed, str(Path(claimed.workspace_path)),
+                )
+
+
+def test_real_child_cannot_reach_main_module_after_parent_eof(kanban_home, tmp_path):
+    sentinel = tmp_path / "startup-reached"
+    with kb.connect() as conn:
+        worker, _bound = _activate_one_worker(conn)
+        local_lock = f"{kb._claimer_id().split(':', 1)[0]}:child-test"
+        claimed = kb.claim_task(conn, worker, claimer=local_lock)
+        assert claimed is not None
+        env = dict(os.environ)
+        env.update({
+            "HERMES_KANBAN_LAUNCH_REQUIRED": "1",
+            "HERMES_KANBAN_DB": claimed.execution_launch_db_path,
+            "HERMES_KANBAN_TASK": worker,
+            "HERMES_KANBAN_RUN_ID": str(claimed.current_run_id),
+            "HERMES_KANBAN_CLAIM_LOCK": claimed.claim_lock,
+        })
+        code = (
+            "import hermes_cli.main; "
+            f"open({str(sentinel)!r}, 'w', encoding='utf-8').write('reached')"
+        )
+        proc = subprocess.Popen(
+            [sys.executable, "-c", code],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+        )
+        with kb._execution_launch_fence(conn):
+            kb._mark_execution_launch_spawning(
+                conn, claimed, str(Path(claimed.workspace_path)),
+            )
+            kb._set_worker_pid(
+                conn,
+                worker,
+                proc.pid,
+                expected_run_id=claimed.current_run_id,
+                expected_claim_lock=claimed.claim_lock,
+                execution_launch_id=claimed.execution_launch_id,
+            )
+        assert proc.stdin is not None
+        proc.stdin.close()  # parent died before publishing the secret
+        proc.wait(timeout=15)
+        assert proc.returncode != 0
+        assert not sentinel.exists()
+        assert kb.reclaim_task(conn, worker, reason="child EOF cleanup")
+
+
+def test_real_child_reaches_main_only_after_pid_bound_authorization(
+    kanban_home, tmp_path,
+):
+    sentinel = tmp_path / "startup-authorized"
+    env_dump = tmp_path / "startup-env.json"
+    with kb.connect() as conn:
+        worker, _bound = _activate_one_worker(conn, "authorized-child")
+        local_lock = f"{kb._claimer_id().split(':', 1)[0]}:authorized-child"
+        claimed = kb.claim_task(conn, worker, claimer=local_lock)
+        assert claimed is not None
+        env = dict(os.environ)
+        env.update({
+            "HERMES_KANBAN_LAUNCH_REQUIRED": "1",
+            "HERMES_KANBAN_DB": claimed.execution_launch_db_path,
+            "HERMES_KANBAN_TASK": worker,
+            "HERMES_KANBAN_RUN_ID": str(claimed.current_run_id),
+            "HERMES_KANBAN_CLAIM_LOCK": claimed.claim_lock,
+        })
+        assert claimed.execution_launch_nonce not in json.dumps(env)
+        code = (
+            "import json, os; import hermes_cli.main; "
+            f"open({str(sentinel)!r}, 'w', encoding='utf-8').write('authorized'); "
+            f"open({str(env_dump)!r}, 'w', encoding='utf-8').write(json.dumps(dict(os.environ)))"
+        )
+        proc = subprocess.Popen(
+            [sys.executable, "-c", code],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+        )
+        with kb._execution_launch_fence(conn):
+            kb._mark_execution_launch_spawning(
+                conn, claimed, str(Path(claimed.workspace_path)),
+            )
+            kb._set_worker_pid(
+                conn,
+                worker,
+                proc.pid,
+                expected_run_id=claimed.current_run_id,
+                expected_claim_lock=claimed.claim_lock,
+                execution_launch_id=claimed.execution_launch_id,
+            )
+        assert proc.stdin is not None
+        proc.stdin.write(json.dumps({
+            "launch_id": claimed.execution_launch_id,
+            "nonce": claimed.execution_launch_nonce,
+        }).encode("utf-8") + b"\n")
+        proc.stdin.close()
+        proc.wait(timeout=20)
+        assert proc.returncode == 0, proc.stderr.read().decode("utf-8", errors="replace")
+        assert sentinel.read_text(encoding="utf-8") == "authorized"
+        child_env = json.loads(env_dump.read_text(encoding="utf-8"))
+        assert claimed.execution_launch_nonce not in json.dumps(child_env)
+        assert "HERMES_KANBAN_LAUNCH_REQUIRED" not in child_env
+        launch = conn.execute(
+            "SELECT state, exit_requested_at FROM execution_launches "
+            "WHERE task_id = ?", (worker,)
+        ).fetchone()
+        assert launch["state"] == "started"
+        assert launch["exit_requested_at"] is not None
+        assert kb.reconcile_execution_launch_exits(conn) == 1
+        launch = conn.execute(
+            "SELECT state FROM execution_launches WHERE task_id = ?", (worker,)
+        ).fetchone()
+        assert launch["state"] == "exited"
+
+
+def test_shutdown_request_cannot_certify_a_still_running_child(
+    kanban_home, tmp_path,
+):
+    sentinel = tmp_path / "alive-after-exit-request"
+    with kb.connect() as conn:
+        worker, bound = _activate_one_worker(conn, "shutdown-order")
+        claimed = kb.claim_task(
+            conn,
+            worker,
+            claimer=f"{kb._claimer_id().split(':', 1)[0]}:shutdown-order",
+        )
+        assert claimed is not None
+        env = dict(os.environ)
+        env.update({
+            "HERMES_KANBAN_LAUNCH_REQUIRED": "1",
+            "HERMES_KANBAN_DB": claimed.execution_launch_db_path,
+            "HERMES_KANBAN_TASK": worker,
+            "HERMES_KANBAN_RUN_ID": str(claimed.current_run_id),
+            "HERMES_KANBAN_CLAIM_LOCK": claimed.claim_lock,
+        })
+        code = (
+            "import atexit, time\n"
+            "def linger():\n"
+            f" open({str(sentinel)!r}, 'w', encoding='utf-8').write('alive')\n"
+            " time.sleep(2)\n"
+            "atexit.register(linger)\n"
+            "import hermes_cli.main\n"
+        )
+        proc = subprocess.Popen(
+            [sys.executable, "-c", code],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+        )
+        with kb._execution_launch_fence(conn):
+            kb._mark_execution_launch_spawning(
+                conn, claimed, str(Path(claimed.workspace_path)),
+            )
+            kb._set_worker_pid(
+                conn,
+                worker,
+                proc.pid,
+                expected_run_id=claimed.current_run_id,
+                expected_claim_lock=claimed.claim_lock,
+                execution_launch_id=claimed.execution_launch_id,
+            )
+        assert proc.stdin is not None
+        proc.stdin.write(json.dumps({
+            "launch_id": claimed.execution_launch_id,
+            "nonce": claimed.execution_launch_nonce,
+        }).encode("utf-8") + b"\n")
+        proc.stdin.close()
+        deadline = time.time() + 15
+        while not sentinel.exists() and time.time() < deadline:
+            time.sleep(0.05)
+        assert sentinel.exists()
+        assert proc.poll() is None
+        launch = conn.execute(
+            "SELECT state, exit_requested_at, exited_at FROM execution_launches "
+            "WHERE launch_id = ?",
+            (claimed.execution_launch_id,),
+        ).fetchone()
+        assert launch["state"] == "started"
+        assert launch["exit_requested_at"] is not None
+        assert launch["exited_at"] is None
+        assert kb.reconcile_execution_launch_exits(conn) == 0
+        with pytest.raises(kb.ExecutionAdmissionError, match="cannot seal"):
+            kb.seal_execution_admission(
+                conn,
+                authorization_id=AUTH,
+                generation=GENERATION,
+                policy_sha256=bound["policy_sha256"],
+                reason="still-running shutdown callback",
+            )
+        proc.wait(timeout=20)
+        assert proc.returncode == 0, proc.stderr.read().decode(
+            "utf-8", errors="replace",
+        )
+        assert kb.reconcile_execution_launch_exits(conn) == 1
+        assert conn.execute(
+            "SELECT state FROM execution_launches WHERE launch_id = ?",
+            (claimed.execution_launch_id,),
+        ).fetchone()["state"] == "exited"
+
+
+def test_external_observer_finds_dead_worker_after_task_became_terminal(
+    kanban_home,
+):
+    with kb.connect() as conn:
+        worker, _bound = _activate_one_worker(conn, "dead-after-terminal")
+        claimed = kb.claim_task(
+            conn,
+            worker,
+            claimer=f"{kb._claimer_id().split(':', 1)[0]}:dead-terminal",
+        )
+        assert claimed is not None
+        env = dict(os.environ)
+        env.update({
+            "HERMES_KANBAN_LAUNCH_REQUIRED": "1",
+            "HERMES_KANBAN_DB": claimed.execution_launch_db_path,
+            "HERMES_KANBAN_TASK": worker,
+            "HERMES_KANBAN_RUN_ID": str(claimed.current_run_id),
+            "HERMES_KANBAN_CLAIM_LOCK": claimed.claim_lock,
+        })
+        proc = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                "import os; import hermes_cli.main; os._exit(0)",
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+        )
+        with kb._execution_launch_fence(conn):
+            kb._mark_execution_launch_spawning(
+                conn, claimed, str(Path(claimed.workspace_path)),
+            )
+            kb._set_worker_pid(
+                conn,
+                worker,
+                proc.pid,
+                expected_run_id=claimed.current_run_id,
+                expected_claim_lock=claimed.claim_lock,
+                execution_launch_id=claimed.execution_launch_id,
+            )
+        assert proc.stdin is not None
+        proc.stdin.write(json.dumps({
+            "launch_id": claimed.execution_launch_id,
+            "nonce": claimed.execution_launch_nonce,
+        }).encode("utf-8") + b"\n")
+        proc.stdin.close()
+        proc.wait(timeout=20)
+        assert proc.returncode == 0, proc.stderr.read().decode(
+            "utf-8", errors="replace",
+        )
+        launch = conn.execute(
+            "SELECT state, exit_requested_at FROM execution_launches "
+            "WHERE launch_id = ?",
+            (claimed.execution_launch_id,),
+        ).fetchone()
+        assert launch["state"] == "started"
+        assert launch["exit_requested_at"] is None
+        # Simulate the worker having already made its business task terminal;
+        # process reconciliation must not depend on that live task phase.
+        conn.execute(
+            "UPDATE tasks SET status = 'done', claim_lock = NULL, "
+            "claim_expires = NULL, worker_pid = NULL WHERE id = ?",
+            (worker,),
+        )
+        conn.commit()
+        assert kb.reconcile_execution_launch_exits(conn) == 1
+        assert conn.execute(
+            "SELECT state FROM execution_launches WHERE launch_id = ?",
+            (claimed.execution_launch_id,),
+        ).fetchone()["state"] == "exited"
+
+
+def test_reloaded_task_cannot_fall_back_to_legacy_spawn(kanban_home):
+    invoked = []
+    with kb.connect() as conn:
+        worker, bound = _activate_one_worker(conn, "reload-capability")
+        claimed = kb.claim_task(conn, worker, claimer="reload:claim")
+        assert claimed is not None
+        assert kb.reclaim_task(conn, worker, reason="reload probe")
+        kb.seal_execution_admission(
+            conn,
+            authorization_id=AUTH,
+            generation=GENERATION,
+            policy_sha256=bound["policy_sha256"],
+            reason="reload probe sealed",
+        )
+        reloaded = kb.get_task(conn, worker)
+        assert reloaded is not None
+        assert reloaded.execution_launch_id is None
+
+        def spawn(*_args, **_kwargs):
+            invoked.append(True)
+            return None
+
+        with pytest.raises(kb.ExecutionAdmissionError, match="missing.*capability"):
+            kb._spawn_claimed_task(
+                conn,
+                reloaded,
+                str(Path(reloaded.workspace_path)),
+                board=None,
+                spawn_fn=spawn,
+            )
+        assert invoked == []
+
+
+def test_stripped_launch_marker_is_refused_before_main_import(
+    kanban_home, tmp_path,
+):
+    sentinel = tmp_path / "marker-stripped-reached"
+    with kb.connect() as conn:
+        worker, _bound = _activate_one_worker(conn, "stripped-marker")
+        env = dict(os.environ)
+        env.pop("HERMES_KANBAN_LAUNCH_REQUIRED", None)
+        env.update({
+            "HERMES_KANBAN_DB": str(kb._connection_db_path(conn)),
+            "HERMES_KANBAN_TASK": worker,
+        })
+        proc = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import hermes_cli.main; "
+                f"open({str(sentinel)!r}, 'w', encoding='utf-8').write('bad')",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            timeout=20,
+            check=False,
+        )
+        assert proc.returncode != 0
+        assert not sentinel.exists()
+        assert b"one-use launch capability" in proc.stderr
+
+
+def test_worker_environment_allows_read_only_kanban_inspection(
+    kanban_home,
+):
+    with kb.connect() as conn:
+        worker, _bound = _activate_one_worker(conn, "read-only-child-cli")
+        env = dict(os.environ)
+        env.pop("HERMES_KANBAN_LAUNCH_REQUIRED", None)
+        env.update({
+            "HERMES_KANBAN_DB": str(kb._connection_db_path(conn)),
+            "HERMES_KANBAN_TASK": worker,
+        })
+        code = (
+            "import sys; "
+            f"sys.argv = ['hermes', 'kanban', 'show', {worker!r}, '--json']; "
+            "import hermes_cli.main; print('inspection-import-ok')"
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", code],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            timeout=20,
+            check=False,
+        )
+        assert proc.returncode == 0, proc.stderr.decode(
+            "utf-8", errors="replace",
+        )
+        assert b"inspection-import-ok" in proc.stdout
+
+
+def test_unknown_process_birth_closes_pipe_without_signalling(
+    kanban_home, monkeypatch,
+):
+    class Writer:
+        closed = False
+
+        def close(self):
+            self.closed = True
+
+    class Process:
+        def wait(self, timeout=None):
+            raise TimeoutError(timeout)
+
+        def poll(self):
+            return None
+
+    writer = Writer()
+    signals = []
+    monkeypatch.setattr(kb, "_worker_process_start_time", lambda _pid: None)
+    monkeypatch.setattr(
+        kb,
+        "_terminate_reclaimed_worker",
+        lambda *_args, **_kwargs: signals.append(True),
+    )
+    with kb.connect() as conn:
+        worker, bound = _activate_one_worker(conn, "unknown-birth")
+        claimed = kb.claim_task(conn, worker, claimer="unknown:birth")
+        assert claimed is not None
+
+        def spawn(_task, _workspace, *, board=None, execution_launch=None):
+            assert execution_launch is not None
+            return kb.SpawnedWorker(
+                pid=765432,
+                startup_writer=writer,
+                process=Process(),
+            )
+
+        with pytest.raises(
+            kb.ExecutionAdmissionError,
+            match="process start time is unavailable",
+        ):
+            kb._spawn_claimed_task(
+                conn,
+                claimed,
+                str(Path(claimed.workspace_path)),
+                board=None,
+                spawn_fn=spawn,
+            )
+        assert writer.closed
+        assert signals == []
+        launch = conn.execute(
+            "SELECT state, worker_pid, worker_start_time FROM execution_launches "
+            "WHERE launch_id = ?",
+            (claimed.execution_launch_id,),
+        ).fetchone()
+        assert launch["state"] == "spawning"
+        assert launch["worker_pid"] == 765432
+        assert launch["worker_start_time"] is None
+        assert kb.get_task(conn, worker).worker_pid is None
+        with pytest.raises(kb.ExecutionAdmissionError, match="cannot seal"):
+            kb.seal_execution_admission(
+                conn,
+                authorization_id=AUTH,
+                generation=GENERATION,
+                policy_sha256=bound["policy_sha256"],
+                reason="unknown process identity remains held",
+            )
+
+
+def test_recycled_pid_cleanup_uses_only_durable_birth_marker(
+    kanban_home, monkeypatch,
+):
+    class Writer:
+        def write(self, _payload):
+            raise BrokenPipeError("probe")
+
+        def flush(self):
+            pass
+
+        def close(self):
+            pass
+
+    class Process:
+        def wait(self, timeout=None):
+            raise TimeoutError(timeout)
+
+        def poll(self):
+            return None
+
+    monkeypatch.setattr(kb, "_worker_process_start_time", lambda _pid: 111)
+    observed_expected = []
+
+    def observe(_pid, expected_start_time):
+        observed_expected.append(expected_start_time)
+        return {
+            "state": "dead",
+            "reason": "pid_reused",
+            "observed_start_time": 222,
+            "expected_start_time": expected_start_time,
+        }
+
+    monkeypatch.setattr(kb, "_observe_execution_process_identity", observe)
+    monkeypatch.setattr(
+        kb.os,
+        "kill",
+        lambda *_args: pytest.fail("recycled PID must not be signalled"),
+    )
+    with kb.connect() as conn:
+        worker, _bound = _activate_one_worker(conn, "recycled-pid")
+        claimed = kb.claim_task(
+            conn,
+            worker,
+            claimer=f"{kb._claimer_id().split(':', 1)[0]}:recycled-pid",
+        )
+        assert claimed is not None
+
+        def spawn(_task, _workspace, *, board=None, execution_launch=None):
+            assert execution_launch is not None
+            return kb.SpawnedWorker(
+                pid=876543,
+                startup_writer=Writer(),
+                process=Process(),
+            )
+
+        with pytest.raises(BrokenPipeError, match="probe"):
+            kb._spawn_claimed_task(
+                conn,
+                claimed,
+                str(Path(claimed.workspace_path)),
+                board=None,
+                spawn_fn=spawn,
+            )
+        launch = conn.execute(
+            "SELECT state, worker_pid, worker_start_time FROM execution_launches "
+            "WHERE launch_id = ?",
+            (claimed.execution_launch_id,),
+        ).fetchone()
+        assert launch["state"] == "failed"
+        assert launch["worker_pid"] == 876543
+        assert launch["worker_start_time"] == 111
+        assert observed_expected == [111]
+
+
+@pytest.mark.parametrize("terminal_action", ["complete", "block"])
+def test_terminal_task_race_during_revoke_preserves_worker_result(
+    kanban_home, monkeypatch, terminal_action,
+):
+    monkeypatch.setattr(kb, "_worker_process_start_time", lambda _pid: 111)
+    terminalized = False
+
+    def observe(_pid, expected_start_time):
+        assert expected_start_time == 111
+        return {
+            "state": "dead" if terminalized else "alive",
+            "reason": "probe",
+            "observed_start_time": 111,
+            "expected_start_time": expected_start_time,
+        }
+
+    monkeypatch.setattr(kb, "_observe_execution_process_identity", observe)
+    with kb.connect() as conn:
+        worker, bound = _activate_one_worker(conn, f"revoke-{terminal_action}")
+        claimed = kb.claim_task(
+            conn,
+            worker,
+            claimer=f"{kb._claimer_id().split(':', 1)[0]}:revoke-race",
+        )
+        assert claimed is not None
+        with kb._execution_launch_fence(conn):
+            kb._mark_execution_launch_spawning(
+                conn, claimed, str(Path(claimed.workspace_path)),
+            )
+            kb._set_worker_pid(
+                conn,
+                worker,
+                654321,
+                expected_run_id=claimed.current_run_id,
+                expected_claim_lock=claimed.claim_lock,
+                execution_launch_id=claimed.execution_launch_id,
+            )
+        kb.consume_execution_launch(
+            conn,
+            launch_id=claimed.execution_launch_id,
+            nonce=claimed.execution_launch_nonce,
+            task_id=worker,
+            run_id=claimed.current_run_id,
+            claim_lock=claimed.claim_lock,
+            worker_pid=654321,
+        )
+
+        def finish_task(_pid, _signal):
+            nonlocal terminalized
+            with kb.connect() as other:
+                if terminal_action == "complete":
+                    assert kb.complete_task(
+                        other,
+                        worker,
+                        result="preserved-result",
+                        expected_run_id=claimed.current_run_id,
+                        fire_lifecycle_hook=False,
+                    )
+                else:
+                    assert kb.block_task(
+                        other,
+                        worker,
+                        reason="preserved-block",
+                        kind="needs_input",
+                        expected_run_id=claimed.current_run_id,
+                    )
+            terminalized = True
+
+        assert kb.reclaim_task(
+            conn,
+            worker,
+            reason="concurrent terminal race",
+            signal_fn=finish_task,
+        ) is False
+        task = kb.get_task(conn, worker)
+        assert task is not None
+        assert task.status == ("done" if terminal_action == "complete" else "blocked")
+        if terminal_action == "complete":
+            assert task.result == "preserved-result"
+        launch = conn.execute(
+            "SELECT state FROM execution_launches WHERE launch_id = ?",
+            (claimed.execution_launch_id,),
+        ).fetchone()
+        assert launch["state"] == "exited"
+        run = conn.execute(
+            "SELECT outcome FROM task_runs WHERE id = ?",
+            (claimed.current_run_id,),
+        ).fetchone()
+        assert run["outcome"] == (
+            "completed" if terminal_action == "complete" else "blocked"
+        )
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_runs WHERE task_id = ?",
+            (worker,),
+        ).fetchone()[0] == 1
+        sealed = kb.seal_execution_admission(
+            conn,
+            authorization_id=AUTH,
+            generation=GENERATION,
+            policy_sha256=bound["policy_sha256"],
+            reason="terminal race safely reconciled",
+        )
+        assert sealed["state"] == "sealed"
+
+
+def test_default_spawn_refuses_live_admission_without_launch_context(
+    kanban_home, monkeypatch,
+):
+    popen_calls = []
+    monkeypatch.setattr(
+        subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: popen_calls.append(True),
+    )
+    with kb.connect() as conn:
+        worker, _bound = _activate_one_worker(conn, "direct-default-spawn")
+        task = kb.get_task(conn, worker)
+        assert task is not None
+        with pytest.raises(kb.ExecutionAdmissionError, match="unguarded"):
+            kb._default_spawn(task, str(Path(task.workspace_path)))
+        assert popen_calls == []
+
+
+def test_review_identity_binds_the_injected_review_skill(kanban_home):
+    with kb.connect() as conn:
+        worker, bound = _activate_one_worker(conn, "reviewer", lane="review")
+        identity = bound["tasks"][0]["identity"]
+        assert "sdlc-review" in identity["skills"]
+        claimed = kb.claim_review_task(conn, worker, claimer="review:test")
+        assert claimed is not None
+        assert claimed.execution_launch_lane == "review"
 
 
 def _cli(argv):
