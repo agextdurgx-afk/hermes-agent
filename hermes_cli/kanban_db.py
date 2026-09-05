@@ -4986,6 +4986,42 @@ def recompute_ready(
     return promoted
 
 
+def _foreign_parked_task_may_become_executable(
+    conn: sqlite3.Connection,
+    row: sqlite3.Row,
+) -> bool:
+    """Conservatively mirror the post-close promotion + claim boundary.
+
+    A sealed execution admission may close only when a foreign parked task
+    cannot become executable on the next dispatcher tick.  ``todo`` tasks
+    promote once parents are terminal.  Non-sticky ``blocked`` tasks do the
+    same unless their task-local retry limit is exhausted.  When no task-local
+    retry limit exists the dispatcher's configured limit is not stored in the
+    board, so close treats the task as potentially promotable.  An exhausted
+    absolute attempt cap is different: both worker and review claims reject it
+    before inference, so it is not executable.
+    """
+    task_id = row["id"]
+    status = row["status"]
+    if status not in {"todo", "blocked"}:
+        return False
+    if status == "blocked" and _has_sticky_block(conn, task_id):
+        return False
+    if not _parents_satisfied(conn, task_id):
+        return False
+    if status == "blocked" and row["max_retries"] is not None:
+        if int(row["consecutive_failures"] or 0) >= int(row["max_retries"]):
+            return False
+    if row["max_attempts"] is not None:
+        attempts = int(conn.execute(
+            "SELECT COUNT(*) FROM task_runs WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()[0])
+        if attempts >= int(row["max_attempts"]):
+            return False
+    return _resume_status_from_events(conn, task_id) in {"ready", "review"}
+
+
 # ---------------------------------------------------------------------------
 # Claim / complete / block
 # ---------------------------------------------------------------------------
@@ -5731,6 +5767,24 @@ def close_execution_admission(
                 raise ExecutionAdmissionError(
                     "cannot close while foreign work is executable: "
                     f"{foreign['id']} ({foreign['status']})"
+                )
+            parked_foreign = conn.execute(
+                "SELECT id, status, consecutive_failures, max_retries, max_attempts "
+                "FROM tasks WHERE status IN ('todo','blocked') "
+                "AND id NOT IN (" + placeholders + ") ORDER BY id",
+                tuple(bound_ids),
+            ).fetchall()
+            promotable = next(
+                (
+                    row for row in parked_foreign
+                    if _foreign_parked_task_may_become_executable(conn, row)
+                ),
+                None,
+            )
+            if promotable is not None:
+                raise ExecutionAdmissionError(
+                    "cannot close while foreign parked work is promotable: "
+                    f"{promotable['id']} ({promotable['status']})"
                 )
             conn.execute(
                 "UPDATE execution_admissions "

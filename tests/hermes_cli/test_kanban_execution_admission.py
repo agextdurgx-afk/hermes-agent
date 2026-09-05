@@ -570,6 +570,90 @@ def test_close_waits_for_competing_writer_then_observes_its_foreign_ready_task(
         assert status["live"] is True
 
 
+@pytest.mark.parametrize("foreign_status", ["todo", "blocked"])
+def test_close_rejects_foreign_parked_work_promotable_on_next_tick(
+    kanban_home, foreign_status
+):
+    with kb.connect() as conn:
+        _begin(conn)
+        worker = _task(conn, "collector")
+        bound = _bind(conn, [{
+            "task_id": worker,
+            "execution_kind": "worker",
+            "allowed_claim_status": "ready",
+        }])
+        _activate(conn, bound["policy_sha256"])
+        sealed = kb.seal_execution_admission(
+            conn,
+            authorization_id=AUTH,
+            generation=GENERATION,
+            policy_sha256=bound["policy_sha256"],
+            reason="replay terminal evidence persisted",
+        )
+        foreign = _task(conn, f"foreign-promotable-{foreign_status}")
+        conn.execute(
+            "UPDATE tasks SET status = ? WHERE id = ?",
+            (foreign_status, foreign),
+        )
+        conn.commit()
+
+        with pytest.raises(
+            kb.ExecutionAdmissionError,
+            match="cannot close while foreign parked work is promotable",
+        ):
+            kb.close_execution_admission(
+                conn,
+                authorization_id=AUTH,
+                generation=GENERATION,
+                policy_sha256=sealed["policy_sha256"],
+            )
+        status = kb.execution_admission_status(conn, AUTH)
+        assert status["state"] == "sealed"
+        assert status["live"] is True
+
+        # This is the exact delayed path the close fence must prevent.
+        assert kb.recompute_ready(conn) == 1
+        assert kb.claim_task(conn, foreign, claimer="test:foreign-promoted") is None
+
+
+def test_close_allows_only_nonpromotable_foreign_parked_work(kanban_home):
+    with kb.connect() as conn:
+        _begin(conn)
+        worker = _task(conn, "collector")
+        bound = _bind(conn, [{
+            "task_id": worker,
+            "execution_kind": "worker",
+            "allowed_claim_status": "ready",
+        }])
+        _activate(conn, bound["policy_sha256"])
+        sealed = kb.seal_execution_admission(
+            conn,
+            authorization_id=AUTH,
+            generation=GENERATION,
+            policy_sha256=bound["policy_sha256"],
+            reason="replay terminal evidence persisted",
+        )
+        sticky = _task(conn, "foreign-sticky-blocked")
+        conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (sticky,))
+        conn.commit()
+        assert kb.block_task(
+            conn,
+            sticky,
+            reason="human evidence required",
+            kind="needs_input",
+        )
+
+        closed = kb.close_execution_admission(
+            conn,
+            authorization_id=AUTH,
+            generation=GENERATION,
+            policy_sha256=sealed["policy_sha256"],
+        )
+        assert closed["state"] == "closed"
+        assert kb.recompute_ready(conn) == 0
+        assert kb.claim_task(conn, sticky, claimer="test:sticky") is None
+
+
 def test_execution_admission_is_scoped_to_one_board_database(tmp_path):
     first_path = tmp_path / "first.db"
     second_path = tmp_path / "second.db"
