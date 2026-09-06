@@ -310,3 +310,89 @@ def count_incidents(state: Optional[str] = None) -> int:
                 (state,),
             ).fetchone()
     return int(row["n"]) if row is not None else 0
+
+
+def acknowledge_incidents_cas(request: Dict[str, Any]) -> Dict[str, Any]:
+    """Close an exact reviewed incident set and causal rows in one write txn.
+
+    The idempotency receipt and closure commit together. A retry can return
+    that receipt only for identical request bytes and unchanged closed rows.
+    No generic ack is used, and concurrent execution claims cannot pass the
+    drained check between validation and the update (BEGIN IMMEDIATE).
+    """
+    import json
+
+    def digest(value):
+        return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
+
+    def normalized_execution(row):
+        value = dict(row)
+        value["error_sha256"] = hashlib.sha256((value.pop("error") or "").encode()).hexdigest()
+        return value
+
+    entries = request.get("incidents")
+    operation_id = request.get("acknowledgement_id")
+    job_id = request.get("job_id")
+    if request.get("schema_version") != 1 or not isinstance(entries, list) or not entries or not operation_id or not job_id:
+        raise ValueError("conditional acknowledgement request is incomplete")
+    if len({row["incident"]["id"] for row in entries}) != len(entries):
+        raise ValueError("conditional acknowledgement contains duplicate incidents")
+    request_sha256 = digest(request)
+    with _transaction() as conn:
+        conn.execute("""CREATE TABLE IF NOT EXISTS cron_incident_acknowledgements (
+            id TEXT PRIMARY KEY, request_sha256 TEXT NOT NULL, receipt_json TEXT NOT NULL)""")
+        conn.commit()
+        conn.execute("BEGIN IMMEDIATE")
+        prior = conn.execute("SELECT * FROM cron_incident_acknowledgements WHERE id=?", (operation_id,)).fetchone()
+        if prior and prior["request_sha256"] != request_sha256:
+            raise ValueError("conditional acknowledgement identity was reused")
+        prior_receipt = json.loads(prior["receipt_json"]) if prior else None
+        # Even an idempotent retry must prove there is no newly admitted work.
+        if conn.execute("SELECT 1 FROM executions WHERE job_id=? AND status IN ('claimed','running') LIMIT 1", (job_id,)).fetchone():
+            raise ValueError("conditional acknowledgement requires a drained job")
+        latest = conn.execute("SELECT * FROM executions WHERE job_id=? ORDER BY claimed_at DESC,id DESC LIMIT 1", (job_id,)).fetchone()
+        if (normalized_execution(latest) if latest else None) != request.get("latest_execution"):
+            raise ValueError("conditional acknowledgement latest execution changed")
+        expected_open_ids = sorted(row["incident"]["id"] for row in entries)
+        actual_open_ids = [row[0] for row in conn.execute("SELECT id FROM cron_incidents WHERE state!='closed' ORDER BY id")]
+        if actual_open_ids != ([] if prior else expected_open_ids):
+            raise ValueError("conditional acknowledgement open incident set changed")
+        closed = []
+        for entry in entries:
+            expected = entry["incident"]
+            if expected.get("job_id") != job_id or expected.get("state") not in ("detected", "alerted"):
+                raise ValueError("conditional acknowledgement incident ownership differs")
+            observed = conn.execute("SELECT * FROM cron_incidents WHERE id=?", (expected["id"],)).fetchone()
+            target = next((row for row in prior_receipt["incidents"] if row["id"] == expected["id"]), None) if prior else expected
+            if observed is None or dict(observed) != target:
+                raise ValueError("conditional acknowledgement incident content changed")
+            causal = entry.get("causal_executions")
+            if not isinstance(causal, list) or len(causal) != 2 or len({row["execution"]["id"] for row in causal}) != 2:
+                raise ValueError("conditional acknowledgement requires both exact causal executions")
+            for evidence in causal:
+                execution = evidence["execution"]
+                live = conn.execute("SELECT * FROM executions WHERE id=?", (execution["id"],)).fetchone()
+                if live is None or live["job_id"] != job_id or live["status"] != "failed" or normalized_execution(live) != execution:
+                    raise ValueError("conditional acknowledgement causal execution changed")
+                log = evidence["log"]
+                content = Path(log["path"]).read_bytes()
+                if len(content) != log["bytes"] or hashlib.sha256(content).hexdigest() != log["sha256"]:
+                    raise ValueError("conditional acknowledgement causal log changed")
+                text = content.decode("utf-8")
+                start = text.find("\n\nScript exited with code ")
+                if start < 0 or f"**Job ID:** {job_id}\n" not in text[:start + 2] or text[start + 2:].removesuffix("\n") != live["error"]:
+                    raise ValueError("conditional acknowledgement log does not bind complete error")
+            if entry.get("execution") != causal[1]["execution"] or entry.get("log") != causal[1]["log"]:
+                raise ValueError("conditional acknowledgement incident is not the causal health execution")
+            closed.append(dict(observed))
+        if prior:
+            return prior_receipt
+        now = _hermes_now().isoformat()
+        for row in closed:
+            conn.execute("UPDATE cron_incidents SET state='closed',acked_at=?,closed_at=? WHERE id=?", (now, now, row["id"]))
+            row.update(state="closed", acked_at=now, closed_at=now)
+        receipt = {"schema_version": 1, "acknowledgement_id": operation_id,
+                   "request_sha256": request_sha256, "incidents": closed}
+        conn.execute("INSERT INTO cron_incident_acknowledgements VALUES (?,?,?)",
+                     (operation_id, request_sha256, json.dumps(receipt, sort_keys=True)))
+        return receipt

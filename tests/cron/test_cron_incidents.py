@@ -365,3 +365,125 @@ def test_cli_list_and_ack(monkeypatch, tmp_path, capsys):
         incident_action="ack", state=None, incident_id=None
     )
     assert cron_incidents(missing_args) == 1
+
+
+def _cas_fixture(monkeypatch, tmp_path):
+    import hashlib
+    from cron import executions
+    inc = _point_db(monkeypatch, tmp_path)
+    monkeypatch.setattr(executions, "EXECUTIONS_FILE", inc.EXECUTIONS_FILE)
+    with executions._transaction():
+        pass
+    job = "causal-job-123"
+    errors = ["Script exited with code 1\nstdout:\nrefusal " + "x" * 600,
+              "Script exited with code 1\nstdout:\nhealth failure caused by refusal"]
+    logs = []
+    rows = []
+    with executions._transaction() as conn:
+        for index, error in enumerate(errors):
+            log = tmp_path / f"{index}.md"
+            log.write_text(f"# Cron Job\n\n**Job ID:** {job}\n\n{error}\n")
+            content = log.read_bytes()
+            logs.append({"path": str(log), "bytes": len(content), "sha256": hashlib.sha256(content).hexdigest()})
+            row = dict(id=f"execution-{index}", job_id=job, source="builtin", process_id="owned-process",
+                       pid=123, process_started_at=456, status="failed", handoff_pending=0, handoff_started_at=None,
+                       claimed_at=f"2099-01-01T00:0{index}:00+00:00", started_at=f"2099-01-01T00:0{index}:01+00:00",
+                       finished_at=f"2099-01-01T00:0{index}:02+00:00", error=error)
+            conn.execute(f"INSERT INTO executions ({','.join(row)}) VALUES ({','.join('?' for _ in row)})", list(row.values()))
+            row["error_sha256"] = hashlib.sha256(row.pop("error").encode()).hexdigest()
+            rows.append(row)
+    incident_id, _ = inc.upsert_incident(job, errors[-1], output_file=logs[-1]["path"])
+    entry = {"incident": inc.get_incident(incident_id), "execution": rows[-1], "log": logs[-1],
+             "causal_executions": [{"execution": row, "log": log} for row, log in zip(rows, logs)]}
+    return inc, {"schema_version": 1, "acknowledgement_id": "reviewed-operation", "job_id": job,
+                 "incidents": [entry], "latest_execution": rows[-1]}
+
+
+def test_conditional_ack_is_atomic_idempotent_and_rejects_different_request(monkeypatch, tmp_path):
+    import copy
+    import pytest
+    inc, request = _cas_fixture(monkeypatch, tmp_path)
+    receipt = inc.acknowledge_incidents_cas(request)
+    assert receipt["incidents"][0]["state"] == "closed"
+    # Simulates a lost response immediately after COMMIT.
+    assert inc.acknowledge_incidents_cas(request) == receipt
+    changed = copy.deepcopy(request)
+    changed["incidents"][0]["incident"]["error"] += "unrelated error"
+    with pytest.raises(ValueError, match="identity was reused"):
+        inc.acknowledge_incidents_cas(changed)
+
+
+def test_conditional_ack_refuses_changed_incident_causal_rows_or_logs(monkeypatch, tmp_path):
+    import pytest
+    from cron import executions
+    inc, request = _cas_fixture(monkeypatch, tmp_path)
+    original = request["incidents"][0]
+    # A common error prefix cannot bind a different complete execution cause.
+    with executions._transaction() as conn:
+        conn.execute("UPDATE executions SET error=error || 'unrelated tail' WHERE id='execution-0'")
+    with pytest.raises(ValueError, match="causal execution changed"):
+        inc.acknowledge_incidents_cas(request)
+    assert inc.get_incident(original["incident"]["id"])["state"] == "detected"
+
+
+def test_conditional_ack_refuses_substituted_log_and_active_job(monkeypatch, tmp_path):
+    import pytest
+    from cron import executions
+    inc, request = _cas_fixture(monkeypatch, tmp_path)
+    log = Path(request["incidents"][0]["causal_executions"][0]["log"]["path"])
+    content = log.read_bytes()
+    log.write_bytes(content + b"substitution")
+    with pytest.raises(ValueError, match="causal log changed"):
+        inc.acknowledge_incidents_cas(request)
+    log.write_bytes(content)
+    with executions._transaction() as conn:
+        conn.execute("UPDATE executions SET status='running' WHERE id='execution-0'")
+    with pytest.raises(ValueError, match="drained job"):
+        inc.acknowledge_incidents_cas(request)
+
+
+def test_conditional_ack_rolls_back_closure_if_receipt_write_crashes(monkeypatch, tmp_path):
+    import sqlite3
+    import pytest
+    inc, request = _cas_fixture(monkeypatch, tmp_path)
+    class CrashingConnection(sqlite3.Connection):
+        def execute(self, sql, parameters=()):
+            if sql.startswith("INSERT INTO cron_incident_acknowledgements"):
+                raise RuntimeError("crash before atomic receipt")
+            return super().execute(sql, parameters)
+    connect = inc._connect
+    monkeypatch.setattr(inc, "_connect", lambda: sqlite3.connect(inc._db_path(), factory=CrashingConnection))
+    with pytest.raises(RuntimeError, match="crash before atomic receipt"):
+        inc.acknowledge_incidents_cas(request)
+    monkeypatch.setattr(inc, "_connect", connect)
+    assert inc.get_incident(request["incidents"][0]["incident"]["id"])["state"] == "detected"
+    assert inc.acknowledge_incidents_cas(request)["incidents"][0]["state"] == "closed"
+
+
+def test_conditional_ack_detects_concurrent_sqlite_change(monkeypatch, tmp_path):
+    import sqlite3
+    import pytest
+    inc, request = _cas_fixture(monkeypatch, tmp_path)
+    # A separate connection mutates the exact row after the read snapshot was
+    # formed. BEGIN IMMEDIATE must recapture and compare, never generic-ack it.
+    other = sqlite3.connect(inc._db_path())
+    other.execute("UPDATE cron_incidents SET last_seen_at='2099-02-01' WHERE id=?", (request["incidents"][0]["incident"]["id"],))
+    other.commit(); other.close()
+    with pytest.raises(ValueError, match="incident content changed"):
+        inc.acknowledge_incidents_cas(request)
+
+
+def test_conditional_ack_two_real_processes_share_one_atomic_receipt(monkeypatch, tmp_path):
+    import json
+    import os
+    import subprocess
+    inc, request = _cas_fixture(monkeypatch, tmp_path)
+    script = "import json,sys; from cron.incidents import acknowledge_incidents_cas; print(json.dumps(acknowledge_incidents_cas(json.load(sys.stdin)),sort_keys=True))"
+    env = {**os.environ, "HERMES_HOME": str(tmp_path)}
+    children = [subprocess.Popen([sys.executable, "-c", script], stdin=subprocess.PIPE,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env) for _ in range(2)]
+    for child in children:
+        child.stdin.write(json.dumps(request)); child.stdin.close(); child.stdin = None
+    outputs = [child.communicate(timeout=15) for child in children]
+    assert all(child.returncode == 0 for child in children), outputs
+    assert json.loads(outputs[0][0]) == json.loads(outputs[1][0])
