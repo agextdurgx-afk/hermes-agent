@@ -507,3 +507,140 @@ def test_conditional_ack_exact_pair_closes_both_incidents_and_allows_idle_ticks(
     with executions._transaction() as conn:
         conn.execute("INSERT INTO executions (id,job_id,source,process_id,pid,process_started_at,status,claimed_at) VALUES ('idle-tick',?,'builtin','idle',321,654,'completed','2099-02-01')", (request["job_id"],))
     assert inc.acknowledge_incidents_cas(request) == receipt
+
+
+def _baseline_fixture(monkeypatch, tmp_path):
+    import hashlib,json
+    from cron import recovery_baselines as recovery
+    inc, previous = _cas_fixture(monkeypatch, tmp_path)
+    snapshot = recovery.capture_recovery_snapshot(previous["job_id"])
+    baseline = {"mode": "prospective_recovery_baseline_v1", "incident_disposition": "preserved_unresolved",
+                "reviewed_tezoff_sha": "a"*40, "reviewed_hermes_sha": "b"*40, "cron_snapshot": snapshot}
+    path = tmp_path / "baseline.json"; path.write_text(json.dumps(baseline))
+    baseline_sha = hashlib.sha256(path.read_bytes()).hexdigest()
+    review = {"verdict":"pass", "reviewer_model":"gpt-6-astra", "schema_version":5, "review_version":5, "replacement_authorized":True, "controls":{f"A{i}":"pass" for i in range(1,13)}, "incident_disposition":"preserved_unresolved", "recovery_baseline_sha256":baseline_sha,
+              "reviewed_tezoff_sha":"a"*40,"reviewed_hermes_sha":"b"*40}
+    review_path = tmp_path / "review.json"; review_path.write_text(json.dumps(review))
+    authority = {"baseline":{"path":str(path),"sha256":baseline_sha},
+                 "review":{"path":str(review_path),"sha256":hashlib.sha256(review_path.read_bytes()).hexdigest()}}
+    request = {"schema_version":1,"snapshot":snapshot,"authority":authority,
+               "baseline_id": recovery._digest({"snapshot":snapshot,"authority":authority})}
+    return inc,recovery,request
+
+
+def test_recovery_baseline_preserves_unresolved_incidents_and_is_idempotent(monkeypatch,tmp_path):
+    inc,recovery,request = _baseline_fixture(monkeypatch,tmp_path)
+    before=inc.list_incidents()
+    result=recovery.register_recovery_baseline(request)
+    assert result["incident_disposition"] == "preserved_unresolved"
+    assert recovery.register_recovery_baseline(request) == result
+    assert inc.list_incidents() == before
+    assert recovery.inspect_recovery_baselines() == [{"request":request,"receipt":result}]
+
+
+def test_recovery_baseline_refuses_changed_failure_even_with_same_error_prefix(monkeypatch,tmp_path):
+    import pytest
+    from cron import executions
+    inc,recovery,request = _baseline_fixture(monkeypatch,tmp_path)
+    with executions._transaction() as conn:
+        conn.execute("UPDATE executions SET error=error || 'new failure' WHERE id='execution-0'")
+    with pytest.raises(ValueError,match="inventory changed"):
+        recovery.register_recovery_baseline(request)
+    assert inc.list_incidents()[0]["state"] == "detected"
+
+
+def test_recovery_baseline_later_failures_and_log_drift_are_never_grandfathered(monkeypatch,tmp_path):
+    import pytest
+    from cron import executions
+    inc,recovery,request = _baseline_fixture(monkeypatch,tmp_path)
+    recovery.register_recovery_baseline(request)
+    with executions._transaction() as conn:
+        conn.execute("UPDATE executions SET error=error || 'new failure' WHERE id='execution-0'")
+    with pytest.raises(ValueError,match="later execution changed"):
+        recovery.inspect_recovery_baselines()
+
+
+def test_recovery_baseline_atomic_registration_requires_drained_job_but_inspection_allows_running_work(monkeypatch,tmp_path):
+    import pytest
+    from cron import executions
+    inc,recovery,request = _baseline_fixture(monkeypatch,tmp_path)
+    with executions._transaction() as conn:
+        conn.execute("INSERT INTO executions(id,job_id,source,process_id,pid,status,claimed_at) VALUES('new',?,'builtin','live',123,'running','2099-03-01')",(request["snapshot"]["job_id"],))
+    with pytest.raises(ValueError,match="drained"):
+        recovery.register_recovery_baseline(request)
+    with executions._transaction() as conn:
+        conn.execute("UPDATE executions SET status='completed' WHERE id='new'")
+    recovery.register_recovery_baseline(request)
+    with executions._transaction() as conn:
+        conn.execute("UPDATE executions SET status='running' WHERE id='new'")
+    assert len(recovery.inspect_recovery_baselines()) == 1
+
+
+def test_recovery_baseline_rejects_review_and_log_substitution(monkeypatch,tmp_path):
+    import pytest
+    inc,recovery,request = _baseline_fixture(monkeypatch,tmp_path)
+    path=Path(request["authority"]["review"]["path"])
+    original=path.read_bytes(); path.write_bytes(original+b" ")
+    with pytest.raises(ValueError,match="authority artifact changed"):
+        recovery.register_recovery_baseline(request)
+    path.write_bytes(original)
+    log=Path(request["snapshot"]["logs"][0]["path"]); log.write_text("substituted")
+    with pytest.raises(ValueError,match="log lacks exact job"):
+        recovery.register_recovery_baseline(request)
+
+
+def test_recovery_baseline_crash_rolls_back_without_changing_incident(monkeypatch,tmp_path):
+    import sqlite3,pytest
+    inc,recovery,request = _baseline_fixture(monkeypatch,tmp_path)
+    before=inc.list_incidents()
+    connect=inc._connect
+    class Crash(sqlite3.Connection):
+        def execute(self,sql,parameters=()):
+            if sql.startswith("INSERT INTO cron_recovery_baselines"):
+                super().execute(sql,parameters)
+                raise RuntimeError("lost transaction")
+            return super().execute(sql,parameters)
+    monkeypatch.setattr(inc,"_connect",lambda:sqlite3.connect(inc._db_path(),factory=Crash))
+    with pytest.raises(RuntimeError,match="lost transaction"):
+        recovery.register_recovery_baseline(request)
+    monkeypatch.setattr(inc,"_connect",connect)
+    assert recovery.inspect_recovery_baselines() == []
+    assert inc.list_incidents() == before
+    recovery.register_recovery_baseline(request)
+
+
+def test_recovery_baseline_two_real_processes_register_once_without_acknowledgement(monkeypatch,tmp_path):
+    import json,os,subprocess
+    inc,recovery,request = _baseline_fixture(monkeypatch,tmp_path)
+    script="import json,sys; from cron.recovery_baselines import register_recovery_baseline; print(json.dumps(register_recovery_baseline(json.load(sys.stdin)),sort_keys=True))"
+    children=[subprocess.Popen([sys.executable,"-c",script],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,env={**os.environ,"HERMES_HOME":str(tmp_path)}) for _ in range(2)]
+    for child in children:
+        child.stdin.write(json.dumps(request));child.stdin.close();child.stdin=None
+    output=[child.communicate(timeout=15) for child in children]
+    assert all(child.returncode==0 for child in children),output
+    assert json.loads(output[0][0])==json.loads(output[1][0])
+    assert inc.list_incidents()[0]["state"]=="detected"
+
+
+def test_recovery_baseline_unknown_outcome_never_becomes_operational_debt(monkeypatch,tmp_path):
+    import pytest
+    from cron import executions
+    inc,recovery,request = _baseline_fixture(monkeypatch,tmp_path)
+    recovery.register_recovery_baseline(request)
+    with executions._transaction() as conn:
+        conn.execute("INSERT INTO executions(id,job_id,source,process_id,pid,status,claimed_at) VALUES('unknown',?,'builtin','lost',123,'unknown','2099-03-01')",(request["snapshot"]["job_id"],))
+    with pytest.raises(ValueError,match="unknown execution outcome"):
+        recovery.inspect_recovery_baselines()
+
+
+def test_recovery_baseline_full_review_controls_are_required(monkeypatch,tmp_path):
+    import hashlib,json,pytest
+    inc,recovery,request = _baseline_fixture(monkeypatch,tmp_path)
+    path = Path(request["authority"]["review"]["path"])
+    review = json.loads(path.read_text()); review["controls"]["A12"] = "fail"
+    path.write_text(json.dumps(review))
+    request["authority"]["review"]["sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+    request["baseline_id"] = recovery._digest({"snapshot":request["snapshot"],"authority":request["authority"]})
+    with pytest.raises(ValueError,match="prospective authority"):
+        recovery.register_recovery_baseline(request)
+    assert inc.list_incidents()[0]["state"] == "detected"
