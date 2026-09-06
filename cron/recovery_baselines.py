@@ -54,14 +54,19 @@ def _snapshot(conn, job_id, *, require_drained=True):
     return {"schema_version": 1, "job_id": job_id, "incidents": rows, "failed_executions": failures, "logs": logs}
 
 
-def capture_recovery_snapshot(job_id):
+def capture_recovery_snapshot(job_id, *, require_drained=True):
     conn = sqlite3.connect(f"file:{incidents._db_path()}?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
     try:
         conn.execute("BEGIN")
-        return _snapshot(conn, job_id)
+        return _snapshot(conn, job_id, require_drained=require_drained)
     finally:
         conn.rollback(); conn.close()
+
+
+def inspect_recovery_snapshot(job_id):
+    """Observe exact history while a harmless scheduled tick may be active."""
+    return capture_recovery_snapshot(job_id, require_drained=False)
 
 
 def _verify_authority(request):

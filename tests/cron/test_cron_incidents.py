@@ -670,3 +670,20 @@ def test_conditional_ack_retains_its_causal_rows_through_normal_history_pruning(
     with executions._transaction() as conn:
         executions._prune_unlocked(conn)
     assert inc.acknowledge_incidents_cas(request) == receipt
+
+
+def test_readonly_baseline_observation_allows_active_tick_but_registration_still_requires_idle(monkeypatch,tmp_path):
+    import pytest
+    from cron import executions
+    inc,recovery,request = _baseline_fixture(monkeypatch,tmp_path)
+    with executions._transaction() as conn:
+        conn.execute("INSERT INTO executions(id,job_id,source,process_id,pid,status,claimed_at) VALUES('tick',?,'builtin','live',123,'running','2099-03-01')", (request['snapshot']['job_id'],))
+    assert recovery.inspect_recovery_snapshot(request['snapshot']['job_id']) == request['snapshot']
+    with pytest.raises(ValueError, match='drained'):
+        recovery.capture_recovery_snapshot(request['snapshot']['job_id'])
+    with pytest.raises(ValueError, match='drained'):
+        recovery.register_recovery_baseline(request)
+    with executions._transaction() as conn:
+        conn.execute("UPDATE executions SET status='unknown' WHERE id='tick'")
+    with pytest.raises(ValueError, match='unknown execution outcome'):
+        recovery.inspect_recovery_snapshot(request['snapshot']['job_id'])
