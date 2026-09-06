@@ -351,7 +351,7 @@ def acknowledge_incidents_cas(request: Dict[str, Any]) -> Dict[str, Any]:
         if conn.execute("SELECT 1 FROM executions WHERE job_id=? AND status IN ('claimed','running') LIMIT 1", (job_id,)).fetchone():
             raise ValueError("conditional acknowledgement requires a drained job")
         latest = conn.execute("SELECT * FROM executions WHERE job_id=? ORDER BY claimed_at DESC,id DESC LIMIT 1", (job_id,)).fetchone()
-        if (normalized_execution(latest) if latest else None) != request.get("latest_execution"):
+        if "latest_execution" in request and (normalized_execution(latest) if latest else None) != request["latest_execution"]:
             raise ValueError("conditional acknowledgement latest execution changed")
         expected_open_ids = sorted(row["incident"]["id"] for row in entries)
         actual_open_ids = [row[0] for row in conn.execute("SELECT id FROM cron_incidents WHERE state!='closed' ORDER BY id")]
@@ -382,8 +382,9 @@ def acknowledge_incidents_cas(request: Dict[str, Any]) -> Dict[str, Any]:
                 start = text.find("\n\nScript exited with code ")
                 if start < 0 or f"**Job ID:** {job_id}\n" not in text[:start + 2] or text[start + 2:].removesuffix("\n") != live["error"]:
                     raise ValueError("conditional acknowledgement log does not bind complete error")
-            if entry.get("execution") != causal[1]["execution"] or entry.get("log") != causal[1]["log"]:
-                raise ValueError("conditional acknowledgement incident is not the causal health execution")
+            associated = causal[0] if entry.get("causal_role") == "refusal" else causal[1]
+            if entry.get("execution") != associated["execution"] or entry.get("log") != associated["log"]:
+                raise ValueError("conditional acknowledgement incident is not its exact causal execution")
             closed.append(dict(observed))
         if prior:
             return prior_receipt

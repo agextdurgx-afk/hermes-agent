@@ -487,3 +487,23 @@ def test_conditional_ack_two_real_processes_share_one_atomic_receipt(monkeypatch
     outputs = [child.communicate(timeout=15) for child in children]
     assert all(child.returncode == 0 for child in children), outputs
     assert json.loads(outputs[0][0]) == json.loads(outputs[1][0])
+
+
+def test_conditional_ack_exact_pair_closes_both_incidents_and_allows_idle_ticks(monkeypatch, tmp_path):
+    import copy
+    from cron import executions
+    inc, request = _cas_fixture(monkeypatch, tmp_path)
+    request.pop("latest_execution")
+    health = request["incidents"][0]
+    refusal = copy.deepcopy(health)
+    with executions._transaction() as conn:
+        error = conn.execute("SELECT error FROM executions WHERE id='execution-0'").fetchone()[0]
+    incident_id, _ = inc.upsert_incident(request["job_id"], error, output_file=refusal["causal_executions"][0]["log"]["path"])
+    refusal.update(incident=inc.get_incident(incident_id), causal_role="refusal",
+                   execution=refusal["causal_executions"][0]["execution"], log=refusal["causal_executions"][0]["log"])
+    request["incidents"].append(refusal)
+    receipt = inc.acknowledge_incidents_cas(request)
+    assert len(receipt["incidents"]) == 2
+    with executions._transaction() as conn:
+        conn.execute("INSERT INTO executions (id,job_id,source,process_id,pid,process_started_at,status,claimed_at) VALUES ('idle-tick',?,'builtin','idle',321,654,'completed','2099-02-01')", (request["job_id"],))
+    assert inc.acknowledge_incidents_cas(request) == receipt
