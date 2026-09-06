@@ -687,3 +687,131 @@ def test_readonly_baseline_observation_allows_active_tick_but_registration_still
         conn.execute("UPDATE executions SET status='unknown' WHERE id='tick'")
     with pytest.raises(ValueError, match='unknown execution outcome'):
         recovery.inspect_recovery_snapshot(request['snapshot']['job_id'])
+
+
+def _preparation_fixture(monkeypatch, tmp_path):
+    inc, recovery, baseline = _baseline_fixture(monkeypatch, tmp_path)
+    request = {"schema_version": 1, "job_id": baseline["snapshot"]["job_id"], "binding": {"reviewed_source": "a" * 40, "hold": "b" * 64}}
+    request["preparation_id"] = recovery._digest(request)
+    return inc, recovery, request, baseline["snapshot"]
+
+
+def test_preparation_retains_history_before_review_and_grants_no_authority(monkeypatch, tmp_path):
+    from cron import executions
+    inc, recovery, request, expected = _preparation_fixture(monkeypatch, tmp_path)
+    before = inc.list_incidents()
+    assert recovery.inspect_prepared_recovery_snapshot(request) is None
+    assert recovery.prepare_recovery_snapshot(request) == expected
+    monkeypatch.setattr(executions, "MAX_TERMINAL_EXECUTIONS", 0)
+    with executions._transaction() as conn:
+        executions._prune_unlocked(conn)
+    assert recovery.prepare_recovery_snapshot(request) == expected
+    assert recovery.inspect_prepared_recovery_snapshot(request) == expected
+    assert recovery.inspect_recovery_baselines() == []
+    assert inc.list_incidents() == before
+
+
+def test_preparation_crash_rolls_back_pins_and_observation_together(monkeypatch, tmp_path):
+    import pytest
+    from cron.evidence import evidence_pins
+    inc, recovery, request, expected = _preparation_fixture(monkeypatch, tmp_path)
+    original = recovery.retain_evidence
+    def crash(conn, identity, entries):
+        original(conn, identity, entries)
+        raise RuntimeError("crash after pins")
+    monkeypatch.setattr(recovery, "retain_evidence", crash)
+    with pytest.raises(RuntimeError, match="crash after pins"):
+        recovery.prepare_recovery_snapshot(request)
+    with inc._transaction() as conn:
+        assert evidence_pins(conn) == []
+    assert recovery.inspect_prepared_recovery_snapshot(request) is None
+    monkeypatch.setattr(recovery, "retain_evidence", original)
+    assert recovery.prepare_recovery_snapshot(request) == expected
+
+
+def test_preparation_rejects_new_failures_missing_pins_and_changed_requests(monkeypatch, tmp_path):
+    import pytest
+    inc, recovery, request, _ = _preparation_fixture(monkeypatch, tmp_path)
+    recovery.prepare_recovery_snapshot(request)
+    altered = {**request, "binding": {"different": True}}
+    with pytest.raises(ValueError, match="identity changed"):
+        recovery.prepare_recovery_snapshot(altered)
+    with inc._transaction() as conn:
+        conn.execute("INSERT INTO executions(id,job_id,source,process_id,pid,status,claimed_at,finished_at,error) VALUES('later',?,'builtin','owner',1,'failed','2099-01-01','2099-01-01','unrelated')", (request["job_id"],))
+    with pytest.raises(ValueError, match="evidence changed"):
+        recovery.inspect_prepared_recovery_snapshot(request)
+    with inc._transaction() as conn:
+        conn.execute("DELETE FROM executions WHERE id='later'")
+        conn.execute("DELETE FROM cron_evidence_pins")
+    with pytest.raises(ValueError, match="retention evidence changed"):
+        recovery.prepare_recovery_snapshot(request)
+
+
+def test_two_processes_capture_once_and_pruning_preserves_the_observation(monkeypatch, tmp_path):
+    import json, os, subprocess
+    from cron import executions
+    inc, recovery, request, expected = _preparation_fixture(monkeypatch, tmp_path)
+    script = "import json,sys; from cron.recovery_baselines import prepare_recovery_snapshot; print(json.dumps(prepare_recovery_snapshot(json.load(sys.stdin)),sort_keys=True))"
+    children = [subprocess.Popen([sys.executable, "-c", script], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env={**os.environ, "HERMES_HOME": str(tmp_path)}) for _ in range(2)]
+    for child in children:
+        child.stdin.write(json.dumps(request)); child.stdin.close(); child.stdin = None
+    output = [child.communicate(timeout=15) for child in children]
+    assert all(child.returncode == 0 for child in children), output
+    assert [json.loads(row[0]) for row in output] == [expected, expected]
+    monkeypatch.setattr(executions, "MAX_TERMINAL_EXECUTIONS", 0)
+    with executions._transaction() as conn:
+        executions._prune_unlocked(conn)
+    assert recovery.inspect_prepared_recovery_snapshot(request) == expected
+    assert recovery.inspect_recovery_baselines() == []
+
+
+def test_preparation_owns_the_database_before_a_concurrent_pruner_can_delete(monkeypatch, tmp_path):
+    import os, subprocess
+    inc, recovery, request, expected = _preparation_fixture(monkeypatch, tmp_path)
+    original = recovery.retain_evidence
+    children = []
+    script = """
+import sqlite3
+from cron import incidents, executions
+conn = sqlite3.connect(incidents._db_path(), timeout=0)
+try:
+    conn.execute('BEGIN IMMEDIATE')
+    print('unlocked', flush=True)
+    conn.rollback()
+except sqlite3.OperationalError as error:
+    print('locked' if 'locked' in str(error) else str(error), flush=True)
+finally:
+    conn.close()
+executions.MAX_TERMINAL_EXECUTIONS = 0
+with executions._transaction() as conn:
+    executions._prune_unlocked(conn)
+"""
+    def concurrent_pruner(conn, identity, entries):
+        child = subprocess.Popen([sys.executable, "-c", script], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env={**os.environ, "HERMES_HOME": str(tmp_path)})
+        children.append(child)
+        assert child.stdout.readline().strip() == "locked"
+        original(conn, identity, entries)
+    monkeypatch.setattr(recovery, "retain_evidence", concurrent_pruner)
+    try:
+        assert recovery.prepare_recovery_snapshot(request) == expected
+    finally:
+        for child in children:
+            output = child.communicate(timeout=15)
+            assert child.returncode == 0, output
+    assert recovery.inspect_prepared_recovery_snapshot(request) == expected
+
+
+def test_preparation_refuses_active_capture_and_missing_durable_observation(monkeypatch, tmp_path):
+    import pytest
+    inc, recovery, request, expected = _preparation_fixture(monkeypatch, tmp_path)
+    with inc._transaction() as conn:
+        conn.execute("INSERT INTO executions(id,job_id,source,process_id,pid,status,claimed_at) VALUES('active',?,'builtin','owner',1,'running','2099-01-01')", (request["job_id"],))
+    with pytest.raises(ValueError, match="drained"):
+        recovery.prepare_recovery_snapshot(request)
+    with inc._transaction() as conn:
+        conn.execute("DELETE FROM executions WHERE id='active'")
+    assert recovery.prepare_recovery_snapshot(request) == expected
+    with inc._transaction() as conn:
+        conn.execute("DELETE FROM cron_recovery_preparations")
+    with pytest.raises(ValueError, match="observation is missing"):
+        recovery.prepare_recovery_snapshot(request)

@@ -69,7 +69,65 @@ def inspect_recovery_snapshot(job_id):
     return capture_recovery_snapshot(job_id, require_drained=False)
 
 
-def _verify_authority(request):
+def _preparation_request(request):
+    if (request.get("schema_version") != 1 or not request.get("job_id")
+            or not isinstance(request.get("binding"), dict) or not request["binding"]
+            or request.get("preparation_id") != _digest({k: v for k, v in request.items() if k != "preparation_id"})):
+        raise ValueError("recovery evidence preparation identity changed")
+
+
+def _prepared_snapshot(conn, request):
+    _preparation_request(request)
+    if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='cron_recovery_preparations'").fetchone():
+        if evidence_pins(conn, authority_id="preparation:" + request["preparation_id"]):
+            raise ValueError("prepared recovery observation is missing")
+        return None
+    row = conn.execute("SELECT request_json,snapshot_json FROM cron_recovery_preparations WHERE id=?", (request["preparation_id"],)).fetchone()
+    if row is None:
+        if evidence_pins(conn, authority_id="preparation:" + request["preparation_id"]):
+            raise ValueError("prepared recovery observation is missing")
+        return None
+    if json.loads(row[0]) != request:
+        raise ValueError("prepared recovery evidence request changed")
+    snapshot = json.loads(row[1])
+    _verify_retention(conn, {"baseline_id": "preparation:" + request["preparation_id"], "snapshot": snapshot})
+    if snapshot != _snapshot(conn, request["job_id"], require_drained=False):
+        raise ValueError("prepared recovery evidence changed")
+    return snapshot
+
+
+def prepare_recovery_snapshot(request):
+    """Atomically capture and retain evidence before review, without authority.
+
+    The caller journals this exact request before invoking us. Capture, pins,
+    and the immutable observation commit together; a lost-response retry reads
+    the same observation. No baseline is registered and no incident is closed.
+    """
+    _preparation_request(request)
+    with incidents._transaction() as conn:
+        conn.commit(); conn.execute("BEGIN IMMEDIATE")
+        prior = _prepared_snapshot(conn, request)
+        if prior is not None:
+            return prior
+        snapshot = _snapshot(conn, request["job_id"])
+        conn.execute("CREATE TABLE IF NOT EXISTS cron_recovery_preparations (id TEXT PRIMARY KEY, request_json TEXT NOT NULL, snapshot_json TEXT NOT NULL)")
+        retain_evidence(conn, "preparation:" + request["preparation_id"], _retention_entries({"snapshot": snapshot}))
+        conn.execute("INSERT INTO cron_recovery_preparations VALUES (?,?,?)", (request["preparation_id"], json.dumps(request, sort_keys=True), json.dumps(snapshot, sort_keys=True)))
+        return snapshot
+
+
+def inspect_prepared_recovery_snapshot(request):
+    """Explicit read-only absence; unreadable or drifted evidence is an error."""
+    conn = sqlite3.connect(f"file:{incidents._db_path()}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("BEGIN")
+        return _prepared_snapshot(conn, request)
+    finally:
+        conn.rollback(); conn.close()
+
+
+def _verify_authority(request, conn=None):
     authority = request.get("authority", {})
     for name in ("baseline", "review"):
         proof = authority.get(name, {})
@@ -92,6 +150,9 @@ def _verify_authority(request):
             or review.get("reviewed_tezoff_sha") != baseline.get("reviewed_tezoff_sha")
             or review.get("reviewed_hermes_sha") != baseline.get("reviewed_hermes_sha")):
         raise ValueError("baseline lacks exact prospective authority")
+    if baseline.get("evidence_preparation") is not None:
+        if conn is None or _prepared_snapshot(conn, baseline["evidence_preparation"]) != request["snapshot"]:
+            raise ValueError("baseline lacks its exact prepared evidence")
 
 
 def _retention_entries(request):
@@ -115,7 +176,7 @@ def register_recovery_baseline(request):
     with incidents._transaction() as conn:
         conn.execute("CREATE TABLE IF NOT EXISTS cron_recovery_baselines (id TEXT PRIMARY KEY, job_id TEXT NOT NULL UNIQUE, request_json TEXT NOT NULL, receipt_json TEXT NOT NULL)")
         conn.commit(); conn.execute("BEGIN IMMEDIATE")
-        _verify_authority(request)
+        _verify_authority(request, conn)
         if _snapshot(conn, job_id) != request["snapshot"]:
             raise ValueError("baseline incident or failure inventory changed")
         prior = conn.execute("SELECT * FROM cron_recovery_baselines WHERE job_id=?", (job_id,)).fetchone()
@@ -149,7 +210,7 @@ def inspect_recovery_baselines():
                     or row["job_id"] != request.get("snapshot", {}).get("job_id")
                     or receipt["request_sha256"] != _digest(request)):
                 raise ValueError("stored baseline receipt changed")
-            _verify_authority(request)
+            _verify_authority(request, conn)
             _verify_retention(conn, request)
             if _snapshot(conn, row["job_id"], require_drained=False) != request["snapshot"]:
                 raise ValueError("preserved incident or a later execution changed")
