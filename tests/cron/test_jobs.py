@@ -1956,3 +1956,32 @@ def test_cron_output_retention_preserves_receipt_pins_and_fails_closed_on_unread
     database.write_bytes(b"unreadable database")
     assert _prune_job_output(directory, keep=1) == 0
     assert paths[0].exists() and paths[-2].exists()
+
+
+def test_output_deletion_keeps_pin_writers_excluded_until_unlink_finishes(tmp_path, monkeypatch):
+    import sqlite3
+    from pathlib import Path
+    from cron.jobs import _prune_job_output
+    directory = tmp_path / "cron/output/job"
+    directory.mkdir(parents=True)
+    paths = [directory / f"2026-06-25_10-00-{index:02d}.md" for index in range(3)]
+    for path in paths:
+        path.write_text("evidence")
+    database = tmp_path / "cron/executions.db"
+    original = Path.unlink
+    observed = []
+    def probe_unlink(path, *args, **kwargs):
+        if path in paths:
+            conn = sqlite3.connect(database, timeout=0)
+            try:
+                with pytest.raises(sqlite3.OperationalError, match="locked"):
+                    conn.execute("BEGIN IMMEDIATE")
+                observed.append(path)
+            finally:
+                conn.close()
+        return original(path, *args, **kwargs)
+    monkeypatch.setattr(Path, "unlink", probe_unlink)
+    assert _prune_job_output(directory, keep=1) == 2
+    assert set(observed) == set(paths[:2])
+    with sqlite3.connect(database, timeout=0) as conn:
+        conn.execute("BEGIN IMMEDIATE")

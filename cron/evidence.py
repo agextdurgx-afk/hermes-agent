@@ -7,6 +7,7 @@ from __future__ import annotations
 import re
 import sqlite3
 from pathlib import Path
+from contextlib import contextmanager
 
 
 def evidence_pins(conn, *, kind=None, authority_id=None):
@@ -50,6 +51,24 @@ def retained_log_paths(database_path):
     try:
         conn.execute("BEGIN")
         return {row["identity"] for row in evidence_pins(conn, kind="log")}
+    finally:
+        conn.rollback()
+        conn.close()
+
+
+@contextmanager
+def log_retention_guard(database_path):
+    """Keep pin writers excluded from inspection through filesystem deletion.
+
+    A read-only pin query followed by unlink has a race with a receipt writer.
+    The same immediate SQLite transaction used by receipt writers serializes
+    that whole interval. An empty database is harmless when cron has not yet
+    recorded an execution; creating it also closes the absent-database race.
+    """
+    conn = sqlite3.connect(Path(database_path), timeout=30)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        yield {row["identity"] for row in evidence_pins(conn, kind="log")}
     finally:
         conn.rollback()
         conn.close()
