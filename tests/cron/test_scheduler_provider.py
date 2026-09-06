@@ -940,3 +940,115 @@ def test_multiplex_recovery_isolates_profile_failures(tmp_path):
     assert recovery_homes == [str(failing_home), str(healthy_home)]
     # The failing profile stays in rotation: its ledger may still hold jobs.
     assert set(tick_homes) == {str(failing_home), str(healthy_home)}
+
+
+def test_live_desktop_owner_yields_to_gateway_and_resumes_after_exit(tmp_path):
+    """Real separate processes transfer the lease without stopping the desktop."""
+    import subprocess
+    import sys
+    import textwrap
+
+    home = tmp_path / "profile"
+    (home / "cron").mkdir(parents=True)
+    script = textwrap.dedent("""
+        import os, sys, time, threading
+        from pathlib import Path
+        import cron.scheduler as scheduler
+        import cron.jobs as jobs
+        from cron.scheduler_provider import InProcessCronScheduler
+        root, role = Path(sys.argv[1]), sys.argv[2]
+        stop = threading.Event()
+        def watcher():
+            while not (root / (role + '.stop')).exists(): time.sleep(.01)
+            stop.set()
+        threading.Thread(target=watcher, daemon=True).start()
+        def tick(**kwargs):
+            try:
+                fd = os.open(root / 'active', os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            except FileExistsError:
+                (root / 'overlap').write_text(role)
+                raise
+            try:
+                time.sleep(.03)
+                with (root / (role + '.ticks')).open('a') as out: out.write('tick\\n')
+            finally:
+                os.close(fd)
+                (root / 'active').unlink()
+        scheduler.tick = tick
+        jobs.record_ticker_heartbeat = lambda **kwargs: None
+        InProcessCronScheduler().start(stop, interval=.02,
+            profile_homes=[('profile', root / 'profile')],
+            owner_gate=(lambda: not (root / 'gateway-live').exists()) if role == 'desktop' else None)
+    """)
+    children = []
+    def ticks(role):
+        path = tmp_path / (role + ".ticks")
+        return len(path.read_text().splitlines()) if path.exists() else 0
+    try:
+        desktop = subprocess.Popen([sys.executable, "-c", script, str(tmp_path), "desktop"])
+        children.append(desktop)
+        assert _wait_until(lambda: ticks("desktop") >= 2)
+        (tmp_path / "gateway-live").touch()
+        gateway = subprocess.Popen([sys.executable, "-c", script, str(tmp_path), "gateway"])
+        children.append(gateway)
+        assert _wait_until(lambda: ticks("gateway") >= 2)
+        assert desktop.poll() is None
+        desktop_ticks = ticks("desktop")
+        assert _wait_until(lambda: ticks("gateway") >= 4)
+        assert ticks("desktop") == desktop_ticks
+        (tmp_path / "gateway.stop").touch()
+        gateway.wait(timeout=5)
+        (tmp_path / "gateway-live").unlink()
+        assert _wait_until(lambda: ticks("desktop") > desktop_ticks)
+        assert not (tmp_path / "overlap").exists()
+    finally:
+        for role in ("desktop", "gateway"):
+            (tmp_path / (role + ".stop")).touch()
+        for child in children:
+            try: child.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                child.wait(timeout=5)
+    assert all(child.returncode == 0 for child in children)
+
+
+def test_owner_probe_failure_releases_lease_and_can_recover(tmp_path):
+    from cron.scheduler_provider import InProcessCronScheduler, _try_acquire_multiplex_owner, _release_multiplex_owner
+    home = tmp_path / "profile"
+    home.mkdir()
+    homes = [("profile", home)]
+    stop = threading.Event()
+    seen = threading.Event()
+    permit = threading.Event()
+    permit.set()
+    ticks = []
+    def gate():
+        if permit.is_set(): return True
+        seen.set()
+        raise OSError("identity endpoint temporarily unreadable")
+    def tick(**kwargs):
+        ticks.append(True)
+        if len(ticks) == 1: permit.clear()
+        else: stop.set()
+    with patch("cron.scheduler.tick", side_effect=tick):
+        thread = threading.Thread(target=InProcessCronScheduler().start, args=(stop,),
+            kwargs={"interval": .01, "profile_homes": homes, "owner_gate": gate})
+        thread.start()
+        handle = None
+        try:
+            assert seen.wait(5)
+            deadline = time.monotonic() + 5
+            while handle is None and time.monotonic() < deadline:
+                handle = _try_acquire_multiplex_owner(homes)
+                if handle is None: time.sleep(.01)
+            assert handle is not None
+            _release_multiplex_owner(handle)
+            handle = None
+            permit.set()
+            thread.join(5)
+            assert not thread.is_alive()
+            assert len(ticks) == 2
+        finally:
+            _release_multiplex_owner(handle)
+            stop.set()
+            thread.join(5)

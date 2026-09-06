@@ -68,6 +68,27 @@ def test_multi_profile_homes_passed_to_builtin(monkeypatch, _providers, tmp_path
     assert builtin.start_kwargs is not None
     assert builtin.start_kwargs["interval"] == 7
     assert builtin.start_kwargs["profile_homes"] == homes
+    assert callable(builtin.start_kwargs["owner_gate"])
+
+
+def test_owner_yields_only_for_live_complete_gateway_coverage(monkeypatch, tmp_path):
+    homes = [("default", tmp_path / "default"), ("ops", tmp_path / "ops")]
+    for _, home in homes:
+        home.mkdir()
+    live = {"ops"}
+    identity = {"protocol": 1, "kind": "hermes-gateway", "hermes_home": str(homes[1][1].resolve()), "served_profiles": ["ops"]}
+    monkeypatch.setattr("hermes_cli.profiles._check_gateway_running", lambda home: home.name in live)
+    monkeypatch.setattr("gateway.control_socket.identify_gateway", lambda home, **kw: identity)
+    assert ws._desktop_multiplex_owner_allowed(homes) is True
+    identity["served_profiles"] = ["default", "ops"]
+    assert ws._desktop_multiplex_owner_allowed(homes) is False
+    # A dead gateway's leftover coverage must not suppress desktop failover.
+    live.clear()
+    assert ws._desktop_multiplex_owner_allowed(homes) is True
+    live.add("ops")
+    identity.clear()
+    with pytest.raises(RuntimeError, match="coverage is unavailable"):
+        ws._desktop_multiplex_owner_allowed(homes)
 
 
 def test_single_profile_keeps_legacy_path(monkeypatch, _providers, tmp_path):

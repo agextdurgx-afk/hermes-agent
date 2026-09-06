@@ -157,6 +157,18 @@ def _release_multiplex_owner(handle) -> None:
         handle.close()
 
 
+def _owner_gate_allows(owner_gate, logger):
+    if owner_gate is None:
+        return True
+    try:
+        return owner_gate() is True
+    except Exception:
+        # Never retain the shared lease while its ownership decision is unknown.
+        # Keep the follower alive so a later successful probe can resume it.
+        logger.warning("Multiplex cron ownership probe failed; yielding lease", exc_info=True)
+        return False
+
+
 class CronScheduler(ABC):
     """Axis-B trigger provider. Decides WHEN a due cron job fires.
 
@@ -628,6 +640,7 @@ class InProcessCronScheduler(CronScheduler):
         profile_adapters=None,
         default_profile=None,
         profile_gate=None,
+        owner_gate=None,
     ):
         import logging
         from cron.scheduler import CronTickYielded
@@ -659,6 +672,7 @@ class InProcessCronScheduler(CronScheduler):
                 profile_adapters=profile_adapters,
                 default_profile=default_profile,
                 profile_gate=profile_gate,
+                owner_gate=owner_gate,
             )
             return
 
@@ -740,6 +754,7 @@ class InProcessCronScheduler(CronScheduler):
         profile_adapters=None,
         default_profile=None,
         profile_gate=None,
+        owner_gate=None,
     ):
         """Tick every served profile's cron store when multiplex_profiles is on.
 
@@ -753,6 +768,9 @@ class InProcessCronScheduler(CronScheduler):
         cycle; a profile it rejects is neither ticked nor heartbeated that
         cycle (the desktop ticker uses it to stand down for profiles whose
         own gateway is running, #100489).
+        ``owner_gate() -> bool`` additionally yields the entire shared lease
+        when a live multiplex gateway takes over. The desktop remains a
+        follower and can resume after that gateway exits.
         """
         import logging
         from cron.scheduler import tick as cron_tick
@@ -783,47 +801,49 @@ class InProcessCronScheduler(CronScheduler):
         # durable scheduler owner between ticks. Elect one owner for the whole
         # multiplex loop; followers wait and automatically take over if the
         # owner exits.
-        owner_handle = None
         retry_seconds = max(0.05, min(float(interval or 1), 5.0))
-        while not stop_event.is_set() and owner_handle is None:
+        while not stop_event.is_set():
+            if not _owner_gate_allows(owner_gate, logger):
+                stop_event.wait(retry_seconds)
+                continue
             owner_handle = _try_acquire_multiplex_owner(profile_homes)
             if owner_handle is None:
                 stop_event.wait(retry_seconds)
-        if owner_handle is None:
-            return
-        logger.info(
-            "Acquired multiplex cron owner lease at %s",
-            _multiplex_owner_lock_path(profile_homes),
-        )
-
-        try:
-            self._run_multiplex_owner_loop(
-                stop_event,
-                profile_homes=profile_homes,
-                adapters=adapters,
-                loop=loop,
-                interval=interval,
-                can_dispatch=can_dispatch,
-                profile_adapters=profile_adapters,
-                default_profile=default_profile,
-                profile_gate=profile_gate,
-                cron_tick=cron_tick,
-                CronTickYielded=CronTickYielded,
-                SharedRouteAdapters=SharedRouteAdapters,
-                is_fd_exhaustion=_is_fd_exhaustion,
-                primary_profile_routes_for_current_home=(
-                    _primary_profile_routes_for_current_home
-                ),
-                clear_ticker_error=clear_ticker_error,
-                record_ticker_error=record_ticker_error,
-                record_ticker_heartbeat=record_ticker_heartbeat,
-                use_cron_store=use_cron_store,
-                set_hermes_home_override=set_hermes_home_override,
-                reset_hermes_home_override=reset_hermes_home_override,
-                logger=logger,
-            )
-        finally:
-            _release_multiplex_owner(owner_handle)
+                continue
+            logger.info("Acquired multiplex cron owner lease at %s", _multiplex_owner_lock_path(profile_homes))
+            try:
+                self._run_multiplex_owner_loop(
+                    stop_event,
+                    profile_homes=profile_homes,
+                    adapters=adapters,
+                    loop=loop,
+                    interval=interval,
+                    can_dispatch=can_dispatch,
+                    profile_adapters=profile_adapters,
+                    default_profile=default_profile,
+                    profile_gate=profile_gate,
+                    owner_gate=owner_gate,
+                    cron_tick=cron_tick,
+                    CronTickYielded=CronTickYielded,
+                    SharedRouteAdapters=SharedRouteAdapters,
+                    is_fd_exhaustion=_is_fd_exhaustion,
+                    primary_profile_routes_for_current_home=(
+                        _primary_profile_routes_for_current_home
+                    ),
+                    clear_ticker_error=clear_ticker_error,
+                    record_ticker_error=record_ticker_error,
+                    record_ticker_heartbeat=record_ticker_heartbeat,
+                    use_cron_store=use_cron_store,
+                    set_hermes_home_override=set_hermes_home_override,
+                    reset_hermes_home_override=reset_hermes_home_override,
+                    logger=logger,
+                )
+            finally:
+                _release_multiplex_owner(owner_handle)
+            # A desktop owner may yield to a newly started gateway without
+            # terminating the desktop process. It remains available to take
+            # over after that gateway exits; the same file lock serializes both.
+            stop_event.wait(retry_seconds)
 
     def _run_multiplex_owner_loop(
         self,
@@ -837,6 +857,7 @@ class InProcessCronScheduler(CronScheduler):
         profile_adapters,
         default_profile,
         profile_gate,
+        owner_gate,
         cron_tick,
         CronTickYielded,
         SharedRouteAdapters,
@@ -851,6 +872,9 @@ class InProcessCronScheduler(CronScheduler):
         logger,
     ):
         """Run recovery and ticks after this process owns the multiplex lease."""
+
+        if not _owner_gate_allows(owner_gate, logger):
+            return
 
         # Recovery + initial heartbeat for every profile.
         # A profile may have been deleted since this snapshot was taken;
@@ -883,6 +907,9 @@ class InProcessCronScheduler(CronScheduler):
 
         consecutive_failures = 0
         while not stop_event.is_set():
+            if not _owner_gate_allows(owner_gate, logger):
+                logger.info("Yielding multiplex cron owner lease to the serving gateway")
+                return
             ok = False
             _tick_error = None
             _profile_errors: dict[str, str] = {}

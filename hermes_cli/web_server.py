@@ -267,6 +267,33 @@ def _parent_start_markers_match(actual: str, expected: str) -> bool:
 # when the same module is used across TestClient instances or uvicorn reloads.
 # ---------------------------------------------------------------------------
 
+def _desktop_multiplex_owner_allowed(profile_homes) -> bool:
+    """Yield the global scheduler lease to a live gateway serving this fleet.
+
+    Per-profile deferral cannot work while this desktop retains the lease the
+    gateway needs. Query the live control endpoint rather than treating a PID
+    file, configured multiplex flag, or stale heartbeat as coverage evidence.
+    A single-profile gateway still uses the existing per-profile deferral.
+    """
+    from gateway.control_socket import identify_gateway
+    from hermes_cli.profiles import _check_gateway_running
+
+    live_homes = [(name, Path(home)) for name, home in profile_homes if Path(home).is_dir()]
+    expected = {name for name, _home in live_homes}
+    for _name, home in live_homes:
+        if not _check_gateway_running(home):
+            continue
+        identity = identify_gateway(home, timeout=0.5)
+        if not identity or identity.get("kind") != "hermes-gateway" or identity.get("protocol") != 1:
+            raise RuntimeError("live gateway scheduler coverage is unavailable")
+        if identity.get("hermes_home") != str(home.resolve()):
+            raise RuntimeError("live gateway scheduler identity belongs to another home")
+        served = identity.get("served_profiles")
+        if isinstance(served, list) and all(isinstance(name, str) for name in served) and expected.issubset(served):
+            return False
+    return True
+
+
 def _start_desktop_cron_ticker(stop_event: "threading.Event", interval: int = 60) -> None:
     """Tick the cron scheduler from inside the desktop dashboard backend.
 
@@ -303,6 +330,7 @@ def _start_desktop_cron_ticker(stop_event: "threading.Event", interval: int = 60
             profile_homes = list(profiles_to_serve(multiplex=True))
             if len(profile_homes) > 1:
                 start_kwargs["profile_homes"] = profile_homes
+                start_kwargs["owner_gate"] = lambda: _desktop_multiplex_owner_allowed(profile_homes)
                 # Stand down, per tick, for any profile whose OWN gateway is
                 # running: that gateway ticks it with live adapters, and the
                 # tick-lock race otherwise lets this adapter-less ticker win
