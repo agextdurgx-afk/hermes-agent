@@ -76,7 +76,7 @@ def _preparation_request(request):
         raise ValueError("recovery evidence preparation identity changed")
 
 
-def _prepared_snapshot(conn, request):
+def _prepared_snapshot(conn, request, *, current=True):
     _preparation_request(request)
     if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='cron_recovery_preparations'").fetchone():
         if evidence_pins(conn, authority_id="preparation:" + request["preparation_id"]):
@@ -91,7 +91,7 @@ def _prepared_snapshot(conn, request):
         raise ValueError("prepared recovery evidence request changed")
     snapshot = json.loads(row[1])
     _verify_retention(conn, {"baseline_id": "preparation:" + request["preparation_id"], "snapshot": snapshot})
-    if snapshot != _snapshot(conn, request["job_id"], require_drained=False):
+    if current and snapshot != _snapshot(conn, request["job_id"], require_drained=False):
         raise ValueError("prepared recovery evidence changed")
     return snapshot
 
@@ -127,15 +127,16 @@ def inspect_prepared_recovery_snapshot(request):
         conn.rollback(); conn.close()
 
 
-def _verify_authority(request, conn=None):
+def _verify_authority(request, conn=None, *, current=True):
     authority = request.get("authority", {})
+    documents = {}
     for name in ("baseline", "review"):
         proof = authority.get(name, {})
         content = Path(proof["path"]).read_bytes()
         if hashlib.sha256(content).hexdigest() != proof.get("sha256"):
             raise ValueError("baseline authority artifact changed")
-    baseline = json.loads(Path(authority["baseline"]["path"]).read_bytes())
-    review = json.loads(Path(authority["review"]["path"]).read_bytes())
+        documents[name] = json.loads(content)
+    baseline, review = documents["baseline"], documents["review"]
     if (baseline.get("mode") != "prospective_recovery_baseline_v1"
             or any(not re.fullmatch(r"[0-9a-f]{40}", str(baseline.get(key, ""))) for key in ("reviewed_tezoff_sha", "reviewed_hermes_sha"))
             or baseline.get("incident_disposition") != "preserved_unresolved"
@@ -151,8 +152,9 @@ def _verify_authority(request, conn=None):
             or review.get("reviewed_hermes_sha") != baseline.get("reviewed_hermes_sha")):
         raise ValueError("baseline lacks exact prospective authority")
     if baseline.get("evidence_preparation") is not None:
-        if conn is None or _prepared_snapshot(conn, baseline["evidence_preparation"]) != request["snapshot"]:
+        if conn is None or _prepared_snapshot(conn, baseline["evidence_preparation"], current=current) != request["snapshot"]:
             raise ValueError("baseline lacks its exact prepared evidence")
+    return baseline, review
 
 
 def _retention_entries(request):
@@ -176,7 +178,9 @@ def register_recovery_baseline(request):
     with incidents._transaction() as conn:
         conn.execute("CREATE TABLE IF NOT EXISTS cron_recovery_baselines (id TEXT PRIMARY KEY, job_id TEXT NOT NULL UNIQUE, request_json TEXT NOT NULL, receipt_json TEXT NOT NULL)")
         conn.commit(); conn.execute("BEGIN IMMEDIATE")
-        _verify_authority(request, conn)
+        baseline, _ = _verify_authority(request, conn)
+        if baseline.get("authority_succession") is not None:
+            raise ValueError("a successor must use explicit baseline succession")
         if _snapshot(conn, job_id) != request["snapshot"]:
             raise ValueError("baseline incident or failure inventory changed")
         prior = conn.execute("SELECT * FROM cron_recovery_baselines WHERE job_id=?", (job_id,)).fetchone()
@@ -192,6 +196,134 @@ def register_recovery_baseline(request):
         return receipt
 
 
+def _stored_entry(conn, row):
+    request = json.loads(row["request_json"])
+    receipt = json.loads(row["receipt_json"])
+    if (receipt.get("schema_version") != 1 or receipt.get("incident_disposition") != "preserved_unresolved"
+            or receipt.get("baseline_id") != row["id"] or request.get("baseline_id") != row["id"]
+            or row["id"] != _digest({"snapshot": request.get("snapshot"), "authority": request.get("authority")})
+            or row["job_id"] != request.get("snapshot", {}).get("job_id")
+            or receipt.get("request_sha256") != _digest(request)):
+        raise ValueError("stored baseline receipt changed")
+    _verify_authority(request, conn, current=False)
+    _verify_retention(conn, request)
+    return {"request": request, "receipt": receipt}
+
+
+def _preserved_snapshot(previous, current):
+    if previous.get("job_id") != current.get("job_id"):
+        raise ValueError("baseline succession changed job identity")
+    for field, key in (("incidents", "id"), ("failed_executions", "id"), ("logs", "incident_id")):
+        rows = current[field]
+        inventory = {row[key]: row for row in rows}
+        if len(inventory) != len(rows) or any(inventory.get(row[key]) != row for row in previous[field]):
+            raise ValueError("baseline succession changed preserved " + field)
+
+
+def _succession_binding(baseline, review, previous):
+    binding = baseline.get("authority_succession")
+    expected = {
+        "schema_version": 1,
+        "mode": "reviewed_pre_activation_policy_succession_v1",
+        "previous_baseline_id": previous["request"]["baseline_id"],
+        "previous_request_sha256": _digest(previous["request"]),
+        "previous_receipt_sha256": _digest(previous["receipt"]),
+    }
+    if (not isinstance(binding, dict) or set(binding) != set(expected) | {"maintenance_proof_sha256"}
+            or any(binding.get(key) != value for key, value in expected.items())
+            or not re.fullmatch(r"[0-9a-f]{64}", str(binding.get("maintenance_proof_sha256", "")))
+            or review.get("authority_succession_sha256") != _digest(binding)
+            or baseline.get("evidence_preparation") is None):
+        raise ValueError("baseline succession lacks exact independently reviewed predecessor")
+    return binding
+
+
+def _baseline_chain(conn, root):
+    chain = [_stored_entry(conn, root)]
+    baseline, _ = _verify_authority(chain[0]["request"], conn, current=False)
+    if baseline.get("authority_succession") is not None:
+        raise ValueError("baseline root cannot be a successor")
+    if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='cron_recovery_successions'").fetchone():
+        return chain
+    for generation, row in enumerate(conn.execute(
+            "SELECT * FROM cron_recovery_successions WHERE job_id=? ORDER BY generation", (root["job_id"],)), start=2):
+        previous = chain[-1]
+        if row["generation"] != generation or row["previous_id"] != previous["request"]["baseline_id"]:
+            raise ValueError("baseline succession chain is not contiguous")
+        entry = _stored_entry(conn, row)
+        baseline, review = _verify_authority(entry["request"], conn, current=False)
+        binding = _succession_binding(baseline, review, previous)
+        if (entry["receipt"].get("authority_succession_sha256") != _digest(binding)
+                or entry["receipt"].get("generation") != generation):
+            raise ValueError("baseline succession receipt changed")
+        _preserved_snapshot(previous["request"]["snapshot"], entry["request"]["snapshot"])
+        chain.append(entry)
+    return chain
+
+
+def supersede_recovery_baseline(request):
+    """Explicit reviewed CAS, never automatic recovery or incident closure.
+
+    Keep the original registry row and every successor immutable. A fresh
+    preparation and review may add failure evidence, but cannot remove or
+    rewrite prior evidence. The caller must separately prove its unstarted
+    maintenance boundary; this receipt grants no worker or replay capability.
+    """
+    if request.get("schema_version") != 1 or request.get("baseline_id") != _digest({
+            "snapshot": request.get("snapshot"), "authority": request.get("authority")}):
+        raise ValueError("baseline request identity changed")
+    job_id = request["snapshot"]["job_id"]
+    with incidents._transaction() as conn:
+        conn.commit(); conn.execute("BEGIN IMMEDIATE")
+        root = conn.execute("SELECT * FROM cron_recovery_baselines WHERE job_id=?", (job_id,)).fetchone()
+        if root is None:
+            raise ValueError("baseline succession predecessor is absent")
+        chain = _baseline_chain(conn, root)
+        current = chain[-1]
+        baseline, review = _verify_authority(request, conn)
+        if _snapshot(conn, job_id) != request["snapshot"]:
+            raise ValueError("baseline succession live snapshot changed")
+        # A lost response can only adopt this exact already-current successor.
+        if current["request"]["baseline_id"] == request["baseline_id"]:
+            if len(chain) < 2 or current["request"] != request:
+                raise ValueError("baseline succession retry differs")
+            return current["receipt"]
+        binding = _succession_binding(baseline, review, current)
+        _preserved_snapshot(current["request"]["snapshot"], request["snapshot"])
+        generation = len(chain) + 1
+        receipt = {"schema_version": 1, "baseline_id": request["baseline_id"],
+                   "incident_disposition": "preserved_unresolved", "request_sha256": _digest(request),
+                   "registered_at": incidents._hermes_now().isoformat(), "generation": generation,
+                   "authority_succession_sha256": _digest(binding)}
+        conn.execute("CREATE TABLE IF NOT EXISTS cron_recovery_successions (id TEXT PRIMARY KEY, job_id TEXT NOT NULL, generation INTEGER NOT NULL, previous_id TEXT NOT NULL UNIQUE, request_json TEXT NOT NULL, receipt_json TEXT NOT NULL, UNIQUE(job_id,generation))")
+        retain_evidence(conn, request["baseline_id"], _retention_entries(request))
+        conn.execute("INSERT INTO cron_recovery_successions VALUES (?,?,?,?,?,?)", (
+            request["baseline_id"], job_id, generation, current["request"]["baseline_id"],
+            json.dumps(request, sort_keys=True), json.dumps(receipt, sort_keys=True)))
+        return receipt
+
+
+def inspect_recovery_authority_history(job_id):
+    """Read preserved authority and new evidence without approving a change.
+
+    Unlike current health, planning may observe additional failures. Every old
+    row, log, artifact and retention pin must still match; uncertainty refuses.
+    """
+    conn = sqlite3.connect(f"file:{incidents._db_path()}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("BEGIN")
+        root = conn.execute("SELECT * FROM cron_recovery_baselines WHERE job_id=?", (job_id,)).fetchone()
+        if root is None:
+            raise ValueError("baseline succession predecessor is absent")
+        chain = _baseline_chain(conn, root)
+        observed = _snapshot(conn, job_id, require_drained=False)
+        _preserved_snapshot(chain[-1]["request"]["snapshot"], observed)
+        return {"authority_history": chain, "current_snapshot": observed, "execution_authorized": False}
+    finally:
+        conn.rollback(); conn.close()
+
+
 def inspect_recovery_baselines():
     """Read-only. A drifted checkpoint is an error, never an absent record."""
     conn = sqlite3.connect(f"file:{incidents._db_path()}?mode=ro", uri=True)
@@ -199,22 +331,20 @@ def inspect_recovery_baselines():
     try:
         conn.execute("BEGIN")
         if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='cron_recovery_baselines'").fetchone():
+            if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='cron_recovery_successions'").fetchone():
+                raise ValueError("baseline succession roots are missing")
             return []
+        if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='cron_recovery_successions'").fetchone():
+            if conn.execute("SELECT 1 FROM cron_recovery_successions s LEFT JOIN cron_recovery_baselines b ON b.job_id=s.job_id WHERE b.id IS NULL LIMIT 1").fetchone():
+                raise ValueError("baseline succession has an orphaned authority")
         output = []
         for row in conn.execute("SELECT * FROM cron_recovery_baselines ORDER BY id"):
-            request = json.loads(row["request_json"])
-            receipt = json.loads(row["receipt_json"])
-            if (receipt.get("schema_version") != 1 or receipt.get("incident_disposition") != "preserved_unresolved"
-                    or receipt["baseline_id"] != row["id"] or request.get("baseline_id") != row["id"]
-                    or row["id"] != _digest({"snapshot": request.get("snapshot"), "authority": request.get("authority")})
-                    or row["job_id"] != request.get("snapshot", {}).get("job_id")
-                    or receipt["request_sha256"] != _digest(request)):
-                raise ValueError("stored baseline receipt changed")
+            entry = _baseline_chain(conn, row)[-1]
+            request = entry["request"]
             _verify_authority(request, conn)
-            _verify_retention(conn, request)
             if _snapshot(conn, row["job_id"], require_drained=False) != request["snapshot"]:
                 raise ValueError("preserved incident or a later execution changed")
-            output.append({"request": request, "receipt": receipt})
+            output.append(entry)
         return output
     finally:
         conn.rollback(); conn.close()

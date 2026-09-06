@@ -538,6 +538,174 @@ def test_recovery_baseline_preserves_unresolved_incidents_and_is_idempotent(monk
     assert recovery.inspect_recovery_baselines() == [{"request":request,"receipt":result}]
 
 
+def _succession_fixture(monkeypatch, tmp_path):
+    import hashlib, json
+    from cron import executions
+    inc, recovery, original = _baseline_fixture(monkeypatch, tmp_path)
+    receipt = recovery.register_recovery_baseline(original)
+    with executions._transaction() as conn:
+        conn.execute("INSERT INTO executions(id,job_id,source,process_id,pid,status,claimed_at,finished_at,error) VALUES('new-failure',?,'builtin','dead',123,'failed','2099-03-01','2099-03-01','complete new failure')", (original['snapshot']['job_id'],))
+    preparation = {"schema_version": 1, "job_id": original["snapshot"]["job_id"], "binding": {"reviewed_source": "c" * 40}}
+    preparation["preparation_id"] = recovery._digest(preparation)
+    snapshot = recovery.prepare_recovery_snapshot(preparation)
+    binding = {"schema_version": 1, "mode": "reviewed_pre_activation_policy_succession_v1",
+               "previous_baseline_id": original["baseline_id"], "previous_request_sha256": recovery._digest(original),
+               "previous_receipt_sha256": recovery._digest(receipt), "maintenance_proof_sha256": "d" * 64}
+    baseline = json.loads(Path(original["authority"]["baseline"]["path"]).read_bytes())
+    baseline.update(cron_snapshot=snapshot, reviewed_tezoff_sha="c" * 40, authority_succession=binding, evidence_preparation=preparation)
+    path = tmp_path / "successor-baseline.json"; path.write_text(json.dumps(baseline))
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    review = json.loads(Path(original["authority"]["review"]["path"]).read_bytes())
+    review.update(recovery_baseline_sha256=digest, reviewed_tezoff_sha="c" * 40, authority_succession_sha256=recovery._digest(binding))
+    review_path = tmp_path / "successor-review.json"; review_path.write_text(json.dumps(review))
+    authority = {"baseline": {"path": str(path), "sha256": digest}, "review": {"path": str(review_path), "sha256": hashlib.sha256(review_path.read_bytes()).hexdigest()}}
+    request = {"schema_version": 1, "snapshot": snapshot, "authority": authority,
+               "baseline_id": recovery._digest({"snapshot": snapshot, "authority": authority})}
+    return inc, recovery, original, receipt, request
+
+
+def test_baseline_succession_preserves_history_and_retries_one_exact_receipt(monkeypatch, tmp_path):
+    import pytest
+    inc, recovery, original, receipt, request = _succession_fixture(monkeypatch, tmp_path)
+    before = inc.list_incidents()
+    with pytest.raises(ValueError, match="later execution changed"):
+        recovery.inspect_recovery_baselines()
+    observed = recovery.inspect_recovery_authority_history(request["snapshot"]["job_id"])
+    assert observed == {"authority_history": [{"request": original, "receipt": receipt}],
+                        "current_snapshot": request["snapshot"], "execution_authorized": False}
+    result = recovery.supersede_recovery_baseline(request)
+    assert recovery.supersede_recovery_baseline(request) == result
+    assert result["generation"] == 2
+    assert recovery.inspect_recovery_baselines() == [{"request": request, "receipt": result}]
+    assert inc.list_incidents() == before
+    with inc._transaction() as conn:
+        import json
+        assert json.loads(conn.execute("SELECT request_json FROM cron_recovery_baselines").fetchone()[0]) == original
+        assert json.loads(conn.execute("SELECT receipt_json FROM cron_recovery_baselines").fetchone()[0]) == receipt
+        assert conn.execute("SELECT count(*) FROM cron_recovery_successions").fetchone()[0] == 1
+
+
+def test_baseline_succession_crash_rolls_back_registry_and_pins(monkeypatch, tmp_path):
+    import pytest
+    from cron.evidence import evidence_pins
+    inc, recovery, original, receipt, request = _succession_fixture(monkeypatch, tmp_path)
+    retain = recovery.retain_evidence
+    def crash(conn, identity, entries):
+        retain(conn, identity, entries)
+        raise RuntimeError("crash after successor retention")
+    monkeypatch.setattr(recovery, "retain_evidence", crash)
+    with pytest.raises(RuntimeError, match="crash after"):
+        recovery.supersede_recovery_baseline(request)
+    with inc._transaction() as conn:
+        assert evidence_pins(conn, authority_id=request["baseline_id"]) == []
+    monkeypatch.setattr(recovery, "retain_evidence", retain)
+    assert recovery.supersede_recovery_baseline(request)["generation"] == 2
+
+
+def test_baseline_succession_refuses_active_unknown_or_later_failure(monkeypatch, tmp_path):
+    import pytest
+    from cron import executions
+    inc, recovery, original, receipt, request = _succession_fixture(monkeypatch, tmp_path)
+    with executions._transaction() as conn:
+        conn.execute("INSERT INTO executions(id,job_id,source,process_id,pid,status,claimed_at) VALUES('racing',?,'builtin','live',456,'running','2099-03-01')", (request['snapshot']['job_id'],))
+    with pytest.raises(ValueError, match="drained"):
+        recovery.supersede_recovery_baseline(request)
+    with executions._transaction() as conn:
+        conn.execute("UPDATE executions SET status='unknown' WHERE id='racing'")
+    with pytest.raises(ValueError, match="unknown"):
+        recovery.supersede_recovery_baseline(request)
+    with executions._transaction() as conn:
+        conn.execute("UPDATE executions SET status='failed',finished_at='2099-03-02',error='another error' WHERE id='racing'")
+    with pytest.raises(ValueError, match="prepared recovery evidence changed"):
+        recovery.supersede_recovery_baseline(request)
+
+
+def test_baseline_succession_keeps_prior_artifacts_and_retention_authoritative(monkeypatch, tmp_path):
+    import pytest
+    inc, recovery, original, receipt, request = _succession_fixture(monkeypatch, tmp_path)
+    recovery.supersede_recovery_baseline(request)
+    old_review = Path(original["authority"]["review"]["path"])
+    content = old_review.read_bytes(); old_review.write_bytes(content + b" ")
+    with pytest.raises(ValueError, match="artifact changed"):
+        recovery.inspect_recovery_baselines()
+    with pytest.raises(ValueError, match="artifact changed"):
+        recovery.inspect_recovery_authority_history(request["snapshot"]["job_id"])
+    old_review.write_bytes(content)
+    with inc._transaction() as conn:
+        conn.execute("DELETE FROM cron_evidence_pins WHERE authority_id=?", (original["baseline_id"],))
+    with pytest.raises(ValueError, match="retention"):
+        recovery.inspect_recovery_baselines()
+
+
+def test_baseline_succession_two_processes_commit_once(monkeypatch, tmp_path):
+    import json, os, subprocess
+    inc, recovery, original, receipt, request = _succession_fixture(monkeypatch, tmp_path)
+    script = "import json,sys; from cron.recovery_baselines import supersede_recovery_baseline; print(json.dumps(supersede_recovery_baseline(json.load(sys.stdin)),sort_keys=True))"
+    children = [subprocess.Popen([sys.executable, "-c", script], stdin=subprocess.PIPE,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                env={**os.environ, "HERMES_HOME": str(tmp_path)}) for _ in range(2)]
+    for child in children:
+        child.stdin.write(json.dumps(request)); child.stdin.close(); child.stdin = None
+    outputs = [child.communicate(timeout=20) for child in children]
+    assert [child.returncode for child in children] == [0, 0], outputs
+    assert json.loads(outputs[0][0]) == json.loads(outputs[1][0])
+    assert recovery.inspect_recovery_baselines()[0]["request"] == request
+    with inc._transaction() as conn:
+        assert conn.execute("SELECT count(*) FROM cron_recovery_successions").fetchone()[0] == 1
+
+
+def test_baseline_succession_rejects_stale_predecessor_and_missing_review_binding(monkeypatch, tmp_path):
+    import hashlib, json, pytest
+    inc, recovery, original, receipt, request = _succession_fixture(monkeypatch, tmp_path)
+    review_path = Path(request["authority"]["review"]["path"])
+    content = review_path.read_bytes()
+    review = json.loads(content); del review["authority_succession_sha256"]
+    review_path.write_text(json.dumps(review))
+    request["authority"]["review"]["sha256"] = hashlib.sha256(review_path.read_bytes()).hexdigest()
+    request["baseline_id"] = recovery._digest({"snapshot": request["snapshot"], "authority": request["authority"]})
+    with pytest.raises(ValueError, match="reviewed predecessor"):
+        recovery.supersede_recovery_baseline(request)
+    review_path.write_bytes(content)
+    request["authority"]["review"]["sha256"] = hashlib.sha256(content).hexdigest()
+    request["baseline_id"] = recovery._digest({"snapshot": request["snapshot"], "authority": request["authority"]})
+    recovery.supersede_recovery_baseline(request)
+    # A different fully hashed approval of the same old predecessor cannot
+    # race or replace the winner, even when its source snapshot is identical.
+    alternate_path = tmp_path / "competing-review.json"; alternate_path.write_bytes(content)
+    request["authority"]["review"]["path"] = str(alternate_path)
+    request["baseline_id"] = recovery._digest({"snapshot": request["snapshot"], "authority": request["authority"]})
+    with pytest.raises(ValueError, match="reviewed predecessor"):
+        recovery.supersede_recovery_baseline(request)
+
+
+def test_baseline_succession_refuses_changed_preserved_rows_even_under_fresh_review(monkeypatch, tmp_path):
+    import hashlib, json, pytest
+    from cron import executions
+    inc, recovery, original, receipt, request = _succession_fixture(monkeypatch, tmp_path)
+    with executions._transaction() as conn:
+        conn.execute("UPDATE executions SET error=error || 'tampered' WHERE id='new-failure'")
+    # Even an otherwise valid approved request cannot reuse an earlier
+    # preparation after the live failure inventory changes.
+    with pytest.raises(ValueError, match="prepared recovery evidence changed"):
+        recovery.supersede_recovery_baseline(request)
+    previous = original["snapshot"]
+    changed = json.loads(json.dumps(previous))
+    for field in ("incidents", "failed_executions", "logs"):
+        candidate = json.loads(json.dumps(changed)); candidate[field] = []
+        with pytest.raises(ValueError, match="changed preserved"):
+            recovery._preserved_snapshot(previous, candidate)
+
+
+def test_baseline_succession_orphaned_history_never_looks_absent(monkeypatch, tmp_path):
+    import pytest
+    inc, recovery, original, receipt, request = _succession_fixture(monkeypatch, tmp_path)
+    recovery.supersede_recovery_baseline(request)
+    with inc._transaction() as conn:
+        conn.execute("DELETE FROM cron_recovery_baselines")
+    with pytest.raises(ValueError, match="orphaned"):
+        recovery.inspect_recovery_baselines()
+
+
 def test_recovery_baseline_refuses_changed_failure_even_with_same_error_prefix(monkeypatch,tmp_path):
     import pytest
     from cron import executions
