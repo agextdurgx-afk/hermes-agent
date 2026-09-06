@@ -12,6 +12,7 @@ import re
 import sqlite3
 from pathlib import Path
 from cron import incidents
+from cron.evidence import evidence_pins, retain_evidence
 
 
 def _digest(value):
@@ -88,6 +89,19 @@ def _verify_authority(request):
         raise ValueError("baseline lacks exact prospective authority")
 
 
+def _retention_entries(request):
+    snapshot = request["snapshot"]
+    entries = [{"kind": "execution", "identity": row["id"], "sha256": _digest(row)} for row in snapshot["failed_executions"]]
+    logs = {row["path"]: row["sha256"] for row in snapshot["logs"]}
+    return sorted(entries + [{"kind": "log", "identity": path, "sha256": digest} for path, digest in logs.items()], key=lambda row: (row["kind"], row["identity"]))
+
+
+def _verify_retention(conn, request):
+    expected = [{"authority_id": request["baseline_id"], **entry} for entry in _retention_entries(request)]
+    if evidence_pins(conn, authority_id=request["baseline_id"]) != expected:
+        raise ValueError("baseline retention evidence changed")
+
+
 def register_recovery_baseline(request):
     """One exact write transaction; lost-response retries return one receipt."""
     if request.get("schema_version") != 1 or request.get("baseline_id") != _digest({"snapshot": request.get("snapshot"), "authority": request.get("authority")}):
@@ -103,9 +117,11 @@ def register_recovery_baseline(request):
         if prior:
             if prior["id"] != request["baseline_id"] or json.loads(prior["request_json"]) != request:
                 raise ValueError("a recovery baseline already exists for this job")
+            _verify_retention(conn, request)
             return json.loads(prior["receipt_json"])
         receipt = {"schema_version": 1, "baseline_id": request["baseline_id"], "incident_disposition": "preserved_unresolved",
                    "request_sha256": _digest(request), "registered_at": incidents._hermes_now().isoformat()}
+        retain_evidence(conn, request["baseline_id"], _retention_entries(request))
         conn.execute("INSERT INTO cron_recovery_baselines VALUES (?,?,?,?)", (request["baseline_id"], job_id, json.dumps(request,sort_keys=True), json.dumps(receipt,sort_keys=True)))
         return receipt
 
@@ -129,6 +145,7 @@ def inspect_recovery_baselines():
                     or receipt["request_sha256"] != _digest(request)):
                 raise ValueError("stored baseline receipt changed")
             _verify_authority(request)
+            _verify_retention(conn, request)
             if _snapshot(conn, row["job_id"], require_drained=False) != request["snapshot"]:
                 raise ValueError("preserved incident or a later execution changed")
             output.append({"request": request, "receipt": receipt})

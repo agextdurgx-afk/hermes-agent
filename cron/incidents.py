@@ -337,6 +337,17 @@ def acknowledge_incidents_cas(request: Dict[str, Any]) -> Dict[str, Any]:
         raise ValueError("conditional acknowledgement request is incomplete")
     if len({row["incident"]["id"] for row in entries}) != len(entries):
         raise ValueError("conditional acknowledgement contains duplicate incidents")
+    from cron.evidence import evidence_pins, retain_evidence
+
+    retention_authority = f"acknowledgement:{operation_id}"
+    pins = {}
+    for entry in entries:
+        for proof in entry.get("causal_executions", []):
+            execution = proof["execution"]
+            log = proof["log"]
+            pins[("execution", execution["id"])] = digest(execution)
+            pins[("log", log["path"])] = log["sha256"]
+    retention_entries = [{"kind": kind, "identity": identity, "sha256": sha} for (kind, identity), sha in sorted(pins.items())]
     request_sha256 = digest(request)
     with _transaction() as conn:
         conn.execute("""CREATE TABLE IF NOT EXISTS cron_incident_acknowledgements (
@@ -348,7 +359,7 @@ def acknowledge_incidents_cas(request: Dict[str, Any]) -> Dict[str, Any]:
             raise ValueError("conditional acknowledgement identity was reused")
         prior_receipt = json.loads(prior["receipt_json"]) if prior else None
         # Even an idempotent retry must prove there is no newly admitted work.
-        if conn.execute("SELECT 1 FROM executions WHERE job_id=? AND status IN ('claimed','running') LIMIT 1", (job_id,)).fetchone():
+        if conn.execute("SELECT 1 FROM executions WHERE job_id=? AND status IN ('claimed','running','unknown') LIMIT 1", (job_id,)).fetchone():
             raise ValueError("conditional acknowledgement requires a drained job")
         latest = conn.execute("SELECT * FROM executions WHERE job_id=? ORDER BY claimed_at DESC,id DESC LIMIT 1", (job_id,)).fetchone()
         if "latest_execution" in request and (normalized_execution(latest) if latest else None) != request["latest_execution"]:
@@ -387,7 +398,10 @@ def acknowledge_incidents_cas(request: Dict[str, Any]) -> Dict[str, Any]:
                 raise ValueError("conditional acknowledgement incident is not its exact causal execution")
             closed.append(dict(observed))
         if prior:
+            if evidence_pins(conn, authority_id=retention_authority) != [{"authority_id": retention_authority, **entry} for entry in retention_entries]:
+                raise ValueError("conditional acknowledgement retention evidence changed")
             return prior_receipt
+        retain_evidence(conn, retention_authority, retention_entries)
         now = _hermes_now().isoformat()
         for row in closed:
             conn.execute("UPDATE cron_incidents SET state='closed',acked_at=?,closed_at=? WHERE id=?", (now, now, row["id"]))

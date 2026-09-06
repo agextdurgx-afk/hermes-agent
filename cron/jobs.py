@@ -4454,8 +4454,17 @@ def _prune_job_output(job_output_dir: Path, keep: int) -> int:
         )
     except OSError:
         return 0
+    import sqlite3
+    from cron.evidence import retained_log_paths
+    try:
+        retained = retained_log_paths(job_output_dir.parent.parent / "executions.db")
+    except (OSError, ValueError, sqlite3.Error) as exc:
+        logger.warning("Cron output retention evidence is unreadable; preserving outputs: %s", exc)
+        return 0
     deleted = 0
     for stale in files[keep:]:
+        if str(stale) in retained:
+            continue
         try:
             stale.unlink()
             deleted += 1

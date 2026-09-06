@@ -532,3 +532,20 @@ def test_job_listing_exposes_latest_execution(monkeypatch, tmp_path):
     listed = jobs.list_jobs(include_disabled=True)
     assert listed[0]["latest_execution"]["id"] == record["id"]
     assert listed[0]["latest_execution"]["status"] == "running"
+
+
+def test_receipt_evidence_survives_normal_retention_without_preserving_unrelated_history(monkeypatch, tmp_path):
+    from cron.evidence import retain_evidence
+    executions = _point_ledger(monkeypatch, tmp_path)
+    record = executions.create_execution("evidence", source="builtin")
+    executions.finish_execution(record["id"], success=False, error="preserved")
+    with executions._transaction() as conn:
+        retain_evidence(conn, "reviewed-receipt", [{"kind": "execution", "identity": record["id"], "sha256": "a" * 64}])
+    monkeypatch.setattr(executions, "MAX_TERMINAL_EXECUTIONS", 2)
+    for index in range(6):
+        row = executions.create_execution(f"routine-{index}", source="builtin")
+        executions.finish_execution(row["id"], success=True)
+    assert executions.get_execution(record["id"])["error"] == "preserved"
+    rows = executions.list_executions(limit=100)
+    assert len(rows) == 3
+    assert len([row for row in rows if row["status"] == "completed"]) == 2

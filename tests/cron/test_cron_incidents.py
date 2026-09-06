@@ -644,3 +644,29 @@ def test_recovery_baseline_full_review_controls_are_required(monkeypatch,tmp_pat
     with pytest.raises(ValueError,match="prospective authority"):
         recovery.register_recovery_baseline(request)
     assert inc.list_incidents()[0]["state"] == "detected"
+
+
+def test_recovery_baseline_atomically_retains_every_execution_and_detects_missing_pins(monkeypatch,tmp_path):
+    import pytest
+    from cron import executions
+    inc,recovery,request = _baseline_fixture(monkeypatch,tmp_path)
+    recovery.register_recovery_baseline(request)
+    monkeypatch.setattr(executions, "MAX_TERMINAL_EXECUTIONS", 0)
+    with executions._transaction() as conn:
+        executions._prune_unlocked(conn)
+    assert len(recovery.inspect_recovery_baselines()) == 1
+    with executions._transaction() as conn:
+        conn.execute("DELETE FROM cron_evidence_pins WHERE authority_id=?", (request["baseline_id"],))
+    with pytest.raises(ValueError,match="retention evidence changed"):
+        recovery.inspect_recovery_baselines()
+    assert inc.list_incidents()[0]["state"] == "detected"
+
+
+def test_conditional_ack_retains_its_causal_rows_through_normal_history_pruning(monkeypatch,tmp_path):
+    from cron import executions
+    inc,request = _cas_fixture(monkeypatch,tmp_path)
+    receipt = inc.acknowledge_incidents_cas(request)
+    monkeypatch.setattr(executions, "MAX_TERMINAL_EXECUTIONS", 0)
+    with executions._transaction() as conn:
+        executions._prune_unlocked(conn)
+    assert inc.acknowledge_incidents_cas(request) == receipt

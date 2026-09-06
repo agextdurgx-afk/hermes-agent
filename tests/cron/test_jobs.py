@@ -1937,3 +1937,22 @@ class TestEnsureCronDirWidened:
         with pytest.raises(FileNotFoundError):
             jobs._ensure_cron_dir(scripts_dir)
         assert not deleted_home.exists()
+
+
+def test_cron_output_retention_preserves_receipt_pins_and_fails_closed_on_unreadable_registry(tmp_path):
+    import sqlite3
+    from cron.evidence import retain_evidence
+    from cron.jobs import _prune_job_output
+    directory = tmp_path / "cron/output/job"
+    directory.mkdir(parents=True)
+    paths = [directory / f"2026-06-25_10-00-{index:02d}.md" for index in range(8)]
+    for path in paths:
+        path.write_text("evidence")
+    database = tmp_path / "cron/executions.db"
+    with sqlite3.connect(database) as conn:
+        retain_evidence(conn, "reviewed-receipt", [{"kind": "log", "identity": str(paths[0]), "sha256": "a" * 64}])
+    assert _prune_job_output(directory, keep=2) == 5
+    assert {path.name for path in directory.glob("*.md")} == {paths[0].name, paths[-1].name, paths[-2].name}
+    database.write_bytes(b"unreadable database")
+    assert _prune_job_output(directory, keep=1) == 0
+    assert paths[0].exists() and paths[-2].exists()
