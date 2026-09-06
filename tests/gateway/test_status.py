@@ -388,6 +388,46 @@ class TestGetProcessStartTime:
             p.kill()
             p.wait()
 
+    @pytest.mark.skipif(sys.platform != "darwin", reason="macOS kernel clock adapter")
+    def test_raw_identity_survives_clock_adjustment_in_long_lived_observer(self, monkeypatch):
+        import psutil
+        import subprocess
+        from psutil import _psosx
+        from gateway.control_socket import build_identify_payload
+
+        pid = os.getpid()
+        raw = psutil.Process(pid)._proc.create_time(monotonic=True)
+        expected = int(round(raw * 100))
+        before = build_identify_payload()
+        boot = _psosx.boot_time()
+        monkeypatch.setattr(_psosx, "INIT_BOOT_TIME", boot)
+        for delta in (-600, -1, 1, 600):
+            monkeypatch.setattr(_psosx, "boot_time", lambda: boot + delta)
+            assert psutil.Process(pid).create_time() != raw
+            assert status.get_process_start_time(pid) == expected
+            after = build_identify_payload()
+            assert after["pid"] == before["pid"]
+            assert after["start_time"] == before["start_time"] == expected
+            # A fresh observer has a different boot-time import baseline. Both
+            # observers must still agree, regardless of process time zone.
+            child = subprocess.check_output([sys.executable, "-c",
+                "from gateway.status import get_process_start_time; "
+                f"print(get_process_start_time({pid}))"],
+                env={**os.environ, "TZ": "Asia/Kolkata" if delta < 0 else "America/New_York"}, text=True)
+            assert int(child.strip()) == expected
+
+    def test_linux_stat_comm_cannot_shift_the_starttime_field(self, monkeypatch):
+        # A process name may itself contain both spaces and closing brackets.
+        stat = "123 (worker name ) more) " + " ".join(["0"] * 19 + ["456789", "0"])
+        monkeypatch.setattr(Path, "read_text", lambda *args, **kwargs: stat)
+        assert status.get_process_start_time(123) == 456789
+
+    @pytest.mark.skipif(sys.platform != "darwin", reason="macOS kernel clock adapter")
+    def test_missing_raw_reader_does_not_fall_back_to_adjusted_time(self, monkeypatch):
+        import psutil
+        monkeypatch.setattr(psutil, "Process", lambda pid: SimpleNamespace(create_time=lambda: 123.0))
+        assert status.get_process_start_time(os.getpid()) is None
+
 
 class TestTerminatePid:
     @pytest.mark.windows_only

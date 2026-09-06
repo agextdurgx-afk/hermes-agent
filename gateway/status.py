@@ -422,10 +422,12 @@ def _get_process_start_time(pid: int) -> Optional[int]:
     a process, so a recycled PID (same number, different process) yields a
     different value and is never mistaken for the original.
 
-    On Linux this is field 22 of ``/proc/<pid>/stat`` (start time in clock
-    ticks since boot, an int).  On platforms without ``/proc`` (macOS, Windows)
-    we fall back to ``psutil.Process(pid).create_time()`` — a float epoch
-    timestamp — quantized to an int (centiseconds) for stable equality.
+    On Linux this is field 22 of ``/proc/<pid>/stat`` (boot ticks). On macOS
+    use psutil's raw kernel creation time, not its public wall-clock-adjusted
+    value: a long-lived process can otherwise report a different identity
+    after time synchronization. This deliberately bounded psutil adapter
+    fails closed if the raw reader is unavailable. Windows retains its native
+    creation timestamp. Non-Linux values retain centisecond units.
 
     The two sources are never mixed on a single platform: ``/proc`` always
     succeeds first on Linux, and always fails on macOS/Windows so psutil is
@@ -436,16 +438,20 @@ def _get_process_start_time(pid: int) -> Optional[int]:
     stat_path = Path(f"/proc/{pid}/stat")
     try:
         # Field 22 in /proc/<pid>/stat is process start time (clock ticks).
-        return int(stat_path.read_text(encoding="utf-8").split()[21])
+        # comm is parenthesized and may contain spaces or closing parentheses.
+        return int(stat_path.read_text(encoding="utf-8").rsplit(")", 1)[1].split()[19])
     except (FileNotFoundError, IndexError, PermissionError, ValueError, OSError):
         pass
 
-    # No /proc (macOS / Windows): psutil is a hard dependency and exposes a
-    # cross-platform creation time.  Quantize to centiseconds so repeated reads
-    # of the same process compare equal without float-precision fragility.
+    if sys.platform.startswith("linux"):
+        return None  # Never substitute wall time for an unreadable boot tick.
+
     try:
         import psutil  # type: ignore
-        return int(round(psutil.Process(pid).create_time() * 100))
+        process = psutil.Process(pid)
+        created = (process._proc.create_time(monotonic=True)
+                   if sys.platform == "darwin" else process.create_time())
+        return int(round(created * 100))
     except Exception:
         return None
 
