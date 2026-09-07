@@ -1101,7 +1101,7 @@ The referenced jobs' most recent completed outputs are injected above the prompt
 
 Jobs are stored in `~/.hermes/cron/jobs.json`. Output from job runs is saved to `~/.hermes/cron/output/{job_id}/{timestamp}.md`.
 
-Job definitions are plain JSON on disk: they survive `hermes update`, gateway restarts, and machine reboots. A job that was mid-run during a restart is marked `unknown` in the execution ledger — it is not automatically retried, but the job's next scheduled tick fires normally. See [Execution history](#execution-history) for details.
+Job definitions are plain JSON on disk: they survive `hermes update`, gateway restarts, and machine reboots. After a restart, an interrupted attempt becomes `unknown` only when its original process is proven gone. An unavailable process-start fingerprint or denied observation preserves the current execution and delivery ownership, so a worker that is still running can record its result. Missing identity is never treated as proof of death. An abandoned attempt is not automatically retried; later scheduled occurrences remain separate work. See [Execution history](#execution-history) for details.
 
 :::tip
 Ask the agent to manage jobs through the `cronjob` tool, `hermes cron edit`, or `/cron` — not by patching `jobs.json` directly. Direct edits can fail silently when [file write safety](../security.md#file-write-safety) blocks the path (for example when `HERMES_WRITE_SAFE_ROOT` is set), and the [file-mutation verifier](../configuration.md#file-mutation-verifier) footer is the authoritative signal that nothing was saved.

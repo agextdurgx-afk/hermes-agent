@@ -127,16 +127,24 @@ def _process_start_time(pid: int) -> Optional[int]:
 
 
 def _owner_is_live(pid: int, started_at: Optional[int]) -> bool:
+    """Retain ownership unless death or a different process birth is proven.
+
+    Both execution and delivery recovery use this conservative predicate.
+    An unreadable birth is uncertainty, not evidence that a worker exited;
+    terminalizing its row would prevent the live owner recording its result.
+    """
     try:
         from gateway.status import _pid_exists
         if not _pid_exists(pid):
             return False
     except Exception:
         return True  # fail safe: inability to prove death must not rewrite state
-    if started_at is None:
-        return pid == os.getpid()
+    if type(started_at) is not int or started_at <= 0:
+        return True
     current = _process_start_time(pid)
-    return current is not None and current == started_at
+    if type(current) is not int or current <= 0:
+        return True
+    return current == started_at
 
 
 def _prune_unlocked(conn: sqlite3.Connection) -> None:
