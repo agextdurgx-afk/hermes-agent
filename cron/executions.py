@@ -142,11 +142,13 @@ def _owner_is_live(pid: int, started_at: Optional[int]) -> bool:
 def _prune_unlocked(conn: sqlite3.Connection) -> None:
     from cron.evidence import evidence_pins
 
+    # An unknown outcome is unresolved evidence, not expendable history.
+    # Retain it even before a reviewer can prepare/pin a checkpoint.
     limit = max(0, int(MAX_TERMINAL_EXECUTIONS))
     pinned = {row["identity"] for row in evidence_pins(conn, kind="execution")}
     if pinned:
         stale = conn.execute(
-            "SELECT id FROM executions WHERE status IN ('completed','failed','unknown') "
+            "SELECT id FROM executions WHERE status IN ('completed','failed') "
             "ORDER BY finished_at DESC,claimed_at DESC,id DESC LIMIT -1 OFFSET ?", (limit,)
         ).fetchall()
         conn.executemany("DELETE FROM executions WHERE id=?", [(row[0],) for row in stale if row[0] not in pinned])
@@ -154,7 +156,7 @@ def _prune_unlocked(conn: sqlite3.Connection) -> None:
     conn.execute(
         """DELETE FROM executions WHERE id IN (
              SELECT id FROM executions
-             WHERE status IN ('completed','failed','unknown')
+             WHERE status IN ('completed','failed')
              ORDER BY finished_at DESC, claimed_at DESC, id DESC LIMIT -1 OFFSET ?
            )""",
         (limit,),

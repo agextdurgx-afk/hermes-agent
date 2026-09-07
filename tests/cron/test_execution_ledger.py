@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 import json
 import os
 import sqlite3
@@ -549,3 +551,22 @@ def test_receipt_evidence_survives_normal_retention_without_preserving_unrelated
     rows = executions.list_executions(limit=100)
     assert len(rows) == 3
     assert len([row for row in rows if row["status"] == "completed"]) == 2
+
+
+@pytest.mark.parametrize("with_other_pin", [False, True])
+def test_unknown_outcome_survives_all_terminal_history_pruning(monkeypatch, tmp_path, with_other_pin):
+    from cron.evidence import retain_evidence
+    executions = _point_ledger(monkeypatch, tmp_path)
+    unknown = executions.create_execution("unresolved-job", source="builtin")
+    complete = executions.create_execution("complete-job", source="builtin")
+    executions.finish_execution(complete["id"], success=True)
+    with executions._transaction() as conn:
+        conn.execute("UPDATE executions SET status='unknown',finished_at='2000-01-01',error='outcome unproven' WHERE id=?", (unknown["id"],))
+        before = dict(conn.execute("SELECT * FROM executions WHERE id=?", (unknown["id"],)).fetchone())
+        if with_other_pin:
+            retain_evidence(conn, "other-authority", [{"kind": "execution", "identity": complete["id"], "sha256": "a" * 64}])
+    monkeypatch.setattr(executions, "MAX_TERMINAL_EXECUTIONS", 0)
+    with executions._transaction() as conn:
+        executions._prune_unlocked(conn)
+        assert dict(conn.execute("SELECT * FROM executions WHERE id=?", (unknown["id"],)).fetchone()) == before
+        assert bool(conn.execute("SELECT 1 FROM executions WHERE id=?", (complete["id"],)).fetchone()) is with_other_pin
