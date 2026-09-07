@@ -1038,3 +1038,84 @@ def test_health_review_refuses_unprepared_evidence_or_any_execution_grant(monkey
     with pytest.raises(ValueError, match="prospective authority"):
         recovery.supersede_recovery_baseline(request)
     assert inc.list_incidents() == before
+
+
+def _scoped_health_succession(monkeypatch, tmp_path):
+    import hashlib, json
+    from cron import executions
+    inc, recovery, request = _health_only_succession(monkeypatch, tmp_path)
+    job = 'second-operation'
+    error = 'Script exited with code 1\nexact second job error'
+    log = tmp_path / 'second-operation.md'
+    log.write_text(f'**Job ID:** {job}\n\n{error}\n')
+    with executions._transaction() as conn:
+        conn.execute("INSERT INTO executions(id,job_id,source,process_id,pid,status,claimed_at,finished_at,error) VALUES('second-failure',?,'builtin','dead',321,'failed','2099-03-02','2099-03-02',?)", (job, error))
+    inc.upsert_incident(job, error, output_file=str(log))
+    scope = sorted([request['snapshot']['job_id'], job])
+    preparation = {'schema_version': 1, 'job_id': request['snapshot']['job_id'],
+                   'binding': {'authority_scope': 'operational_health_only', 'operational_job_ids': scope}}
+    preparation['preparation_id'] = recovery._digest(preparation)
+    snapshot = recovery.prepare_recovery_snapshot(preparation)
+    baseline_path = Path(request['authority']['baseline']['path'])
+    baseline = json.loads(baseline_path.read_text())
+    baseline.update(cron_snapshot=snapshot, evidence_preparation=preparation)
+    baseline_path.write_text(json.dumps(baseline))
+    request['authority']['baseline']['sha256'] = hashlib.sha256(baseline_path.read_bytes()).hexdigest()
+    review_path = Path(request['authority']['review']['path'])
+    review = json.loads(review_path.read_text())
+    review['recovery_baseline_sha256'] = request['authority']['baseline']['sha256']
+    review_path.write_text(json.dumps(review))
+    request['authority']['review']['sha256'] = hashlib.sha256(review_path.read_bytes()).hexdigest()
+    request['snapshot'] = snapshot
+    request['baseline_id'] = recovery._digest({'snapshot': snapshot, 'authority': request['authority']})
+    return inc, recovery, request, preparation
+
+
+def test_scoped_health_checkpoint_preserves_multiple_jobs_without_replay_or_incident_closure(monkeypatch, tmp_path):
+    inc, recovery, request, preparation = _scoped_health_succession(monkeypatch, tmp_path)
+    before = inc.list_incidents()
+    selector = {key: request['snapshot'][key] for key in ('job_id', 'job_ids')}
+    history = recovery.inspect_recovery_authority_history(selector)
+    assert history['execution_authorized'] is False
+    assert history['current_snapshot'] == request['snapshot']
+    receipt = recovery.supersede_recovery_baseline(request)
+    assert recovery.supersede_recovery_baseline(request) == receipt
+    assert recovery.inspect_recovery_baselines() == [{'request': request, 'receipt': receipt}]
+    assert recovery.prepare_recovery_snapshot(preparation) == request['snapshot']
+    assert inc.list_incidents() == before
+    assert len({row['job_id'] for row in before}) == 2
+
+
+@pytest.mark.parametrize('kind', ['running', 'unknown', 'new_failure', 'log_drift', 'other_job', 'wrong_job_log', 'missing_pin'])
+def test_scoped_health_checkpoint_refuses_unreviewed_change_on_every_job(monkeypatch, tmp_path, kind):
+    from cron import executions
+    inc, recovery, request, preparation = _scoped_health_succession(monkeypatch, tmp_path)
+    if kind in ('running', 'unknown', 'new_failure'):
+        status = 'failed' if kind == 'new_failure' else kind
+        with executions._transaction() as conn:
+            conn.execute("INSERT INTO executions(id,job_id,source,process_id,pid,status,claimed_at,finished_at,error) VALUES('drift','second-operation','builtin','dead',321,?,'2099-03-03','2099-03-03','new')", (status,))
+    elif kind == 'other_job':
+        inc.upsert_incident('outside-scope', 'new failure', output_file=str(tmp_path / 'absent'))
+    elif kind in ('log_drift', 'wrong_job_log'):
+        path = tmp_path / 'second-operation.md'
+        path.write_text(path.read_text().replace('second-operation', request['snapshot']['job_id']) if kind == 'wrong_job_log' else path.read_text() + 'changed')
+    else:
+        with executions._transaction() as conn:
+            conn.execute("DELETE FROM cron_evidence_pins WHERE authority_id=?", ('preparation:' + preparation['preparation_id'],))
+    before = inc.list_incidents()
+    with pytest.raises(ValueError):
+        recovery.supersede_recovery_baseline(request)
+    assert inc.list_incidents() == before
+
+
+@pytest.mark.parametrize('scope', [[], ['missing-root'], ['root', 'root'], ['root', '../bad'], ['z', 'root']])
+def test_operational_scope_is_explicit_bounded_and_cannot_grant_replay(scope):
+    from cron import recovery_baselines as recovery
+    request = {'schema_version': 1, 'job_id': 'root', 'binding': {'authority_scope': 'operational_health_only', 'operational_job_ids': scope}}
+    request['preparation_id'] = recovery._digest(request)
+    with pytest.raises(ValueError, match='scope'):
+        recovery._preparation_request(request)
+    request['binding'] = {'operational_job_ids': ['root']}
+    request['preparation_id'] = recovery._digest({k: v for k, v in request.items() if k != 'preparation_id'})
+    with pytest.raises(ValueError, match='health-only'):
+        recovery._preparation_request(request)

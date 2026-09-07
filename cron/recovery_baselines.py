@@ -19,22 +19,34 @@ def _digest(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
 
 
-def _snapshot(conn, job_id, *, require_drained=True):
+def _job_scope(job_id, job_ids=None):
+    if job_ids is None:
+        return [job_id]
+    if (not isinstance(job_ids, list) or not 1 <= len(job_ids) <= 64
+            or any(not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", value) for value in job_ids)
+            or job_ids != sorted(set(job_ids)) or job_id not in job_ids):
+        raise ValueError("operational job scope is not exact and bounded")
+    return job_ids
+
+
+def _snapshot(conn, job_id, *, require_drained=True, job_ids=None):
+    scope = _job_scope(job_id, job_ids)
+    placeholders = ",".join("?" for _ in scope)
     rows = [dict(row) for row in conn.execute("SELECT * FROM cron_incidents WHERE state!='closed' ORDER BY id")]
-    if not rows or any(row["job_id"] != job_id for row in rows):
+    if not rows or any(row["job_id"] not in scope for row in rows):
         raise ValueError("baseline requires a nonempty exact single-job incident inventory")
-    if conn.execute("SELECT 1 FROM executions WHERE job_id=? AND status='unknown' LIMIT 1", (job_id,)).fetchone():
+    if conn.execute(f"SELECT 1 FROM executions WHERE job_id IN ({placeholders}) AND status='unknown' LIMIT 1", scope).fetchone():
         raise ValueError("baseline job has an unknown execution outcome")
-    if require_drained and conn.execute("SELECT 1 FROM executions WHERE job_id=? AND status IN ('claimed','running','unknown') LIMIT 1", (job_id,)).fetchone():
+    if require_drained and conn.execute(f"SELECT 1 FROM executions WHERE job_id IN ({placeholders}) AND status IN ('claimed','running','unknown') LIMIT 1", scope).fetchone():
         raise ValueError("baseline job is not proven drained")
     failures = []
     errors = {}
-    for row in conn.execute("SELECT * FROM executions WHERE job_id=? AND status='failed' ORDER BY id", (job_id,)):
+    for row in conn.execute(f"SELECT * FROM executions WHERE job_id IN ({placeholders}) AND status='failed' ORDER BY id", scope):
         item = dict(row)
         error = item.pop("error") or ""
         if not item.get("finished_at"):
             raise ValueError("baseline failed execution is not terminal")
-        errors[item["id"]] = error
+        errors[item["id"]] = (item["job_id"], error)
         item["error_sha256"] = hashlib.sha256(error.encode()).hexdigest()
         failures.append(item)
     logs = []
@@ -43,23 +55,31 @@ def _snapshot(conn, job_id, *, require_drained=True):
         content = path.read_bytes()
         text = content.decode()
         start = text.find("\n\nScript exited with code ")
-        if start < 0 or f"**Job ID:** {job_id}\n" not in text[:start+2]:
+        if start < 0 or f"**Job ID:** {row['job_id']}\n" not in text[:start+2]:
             raise ValueError("baseline incident log lacks exact job identity")
         error = text[start+2:].removesuffix("\n")
-        matches = [key for key, value in errors.items() if value == error]
+        matches = [key for key, value in errors.items() if value == (row["job_id"], error)]
         if not matches or row["error"] != error[:500]:
             raise ValueError("baseline incident is not bound to a complete recorded failure")
         logs.append({"incident_id": row["id"], "path": str(path), "sha256": hashlib.sha256(content).hexdigest(),
                      "bytes": len(content), "matching_execution_ids": matches})
-    return {"schema_version": 1, "job_id": job_id, "incidents": rows, "failed_executions": failures, "logs": logs}
+    snapshot = {"schema_version": 1, "job_id": job_id, "incidents": rows, "failed_executions": failures, "logs": logs}
+    if job_ids is not None:
+        snapshot.update(schema_version=2, job_ids=scope)
+    return snapshot
 
 
 def capture_recovery_snapshot(job_id, *, require_drained=True):
+    job_ids = None
+    if isinstance(job_id, dict):
+        if set(job_id) != {"job_id", "job_ids"}:
+            raise ValueError("unknown operational snapshot selector")
+        job_id, job_ids = job_id["job_id"], job_id["job_ids"]
     conn = sqlite3.connect(f"file:{incidents._db_path()}?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
     try:
         conn.execute("BEGIN")
-        return _snapshot(conn, job_id, require_drained=require_drained)
+        return _snapshot(conn, job_id, require_drained=require_drained, job_ids=job_ids)
     finally:
         conn.rollback(); conn.close()
 
@@ -74,6 +94,11 @@ def _preparation_request(request):
             or not isinstance(request.get("binding"), dict) or not request["binding"]
             or request.get("preparation_id") != _digest({k: v for k, v in request.items() if k != "preparation_id"})):
         raise ValueError("recovery evidence preparation identity changed")
+    scope = request["binding"].get("operational_job_ids")
+    if scope is not None:
+        _job_scope(request["job_id"], scope)
+        if request["binding"].get("authority_scope") != "operational_health_only":
+            raise ValueError("scoped evidence requires health-only authority")
 
 
 def _prepared_snapshot(conn, request, *, current=True):
@@ -91,7 +116,7 @@ def _prepared_snapshot(conn, request, *, current=True):
         raise ValueError("prepared recovery evidence request changed")
     snapshot = json.loads(row[1])
     _verify_retention(conn, {"baseline_id": "preparation:" + request["preparation_id"], "snapshot": snapshot})
-    if current and snapshot != _snapshot(conn, request["job_id"], require_drained=False):
+    if current and snapshot != _snapshot(conn, request["job_id"], require_drained=False, job_ids=request["binding"].get("operational_job_ids")):
         raise ValueError("prepared recovery evidence changed")
     return snapshot
 
@@ -109,7 +134,7 @@ def prepare_recovery_snapshot(request):
         prior = _prepared_snapshot(conn, request)
         if prior is not None:
             return prior
-        snapshot = _snapshot(conn, request["job_id"])
+        snapshot = _snapshot(conn, request["job_id"], job_ids=request["binding"].get("operational_job_ids"))
         conn.execute("CREATE TABLE IF NOT EXISTS cron_recovery_preparations (id TEXT PRIMARY KEY, request_json TEXT NOT NULL, snapshot_json TEXT NOT NULL)")
         retain_evidence(conn, "preparation:" + request["preparation_id"], _retention_entries({"snapshot": snapshot}))
         conn.execute("INSERT INTO cron_recovery_preparations VALUES (?,?,?)", (request["preparation_id"], json.dumps(request, sort_keys=True), json.dumps(snapshot, sort_keys=True)))
@@ -166,6 +191,8 @@ def _verify_authority(request, conn=None, *, current=True):
     )
     if not common or not (health_only if baseline.get("authority_scope") == "operational_health_only" else legacy):
         raise ValueError("baseline lacks exact prospective authority")
+    if request.get("snapshot", {}).get("job_ids") is not None and not health_only:
+        raise ValueError("scoped evidence cannot authorize replay")
     if baseline.get("evidence_preparation") is not None:
         if conn is None or _prepared_snapshot(conn, baseline["evidence_preparation"], current=current) != request["snapshot"]:
             raise ValueError("baseline lacks its exact prepared evidence")
@@ -196,7 +223,7 @@ def register_recovery_baseline(request):
         baseline, _ = _verify_authority(request, conn)
         if baseline.get("authority_succession") is not None:
             raise ValueError("a successor must use explicit baseline succession")
-        if _snapshot(conn, job_id) != request["snapshot"]:
+        if _snapshot(conn, job_id, job_ids=request["snapshot"].get("job_ids")) != request["snapshot"]:
             raise ValueError("baseline incident or failure inventory changed")
         prior = conn.execute("SELECT * FROM cron_recovery_baselines WHERE job_id=?", (job_id,)).fetchone()
         if prior:
@@ -228,6 +255,10 @@ def _stored_entry(conn, row):
 def _preserved_snapshot(previous, current):
     if previous.get("job_id") != current.get("job_id"):
         raise ValueError("baseline succession changed job identity")
+    previous_scope = _job_scope(previous["job_id"], previous.get("job_ids"))
+    current_scope = _job_scope(current["job_id"], current.get("job_ids"))
+    if not set(previous_scope).issubset(current_scope):
+        raise ValueError("baseline succession narrowed operational job scope")
     for field, key in (("incidents", "id"), ("failed_executions", "id"), ("logs", "incident_id")):
         rows = current[field]
         inventory = {row[key]: row for row in rows}
@@ -296,7 +327,7 @@ def supersede_recovery_baseline(request):
         chain = _baseline_chain(conn, root)
         current = chain[-1]
         baseline, review = _verify_authority(request, conn)
-        if _snapshot(conn, job_id) != request["snapshot"]:
+        if _snapshot(conn, job_id, job_ids=request["snapshot"].get("job_ids")) != request["snapshot"]:
             raise ValueError("baseline succession live snapshot changed")
         # A lost response can only adopt this exact already-current successor.
         if current["request"]["baseline_id"] == request["baseline_id"]:
@@ -324,6 +355,11 @@ def inspect_recovery_authority_history(job_id):
     Unlike current health, planning may observe additional failures. Every old
     row, log, artifact and retention pin must still match; uncertainty refuses.
     """
+    job_ids = None
+    if isinstance(job_id, dict):
+        if set(job_id) != {"job_id", "job_ids"}:
+            raise ValueError("unknown operational history selector")
+        job_id, job_ids = job_id["job_id"], job_id["job_ids"]
     conn = sqlite3.connect(f"file:{incidents._db_path()}?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
     try:
@@ -332,7 +368,7 @@ def inspect_recovery_authority_history(job_id):
         if root is None:
             raise ValueError("baseline succession predecessor is absent")
         chain = _baseline_chain(conn, root)
-        observed = _snapshot(conn, job_id, require_drained=False)
+        observed = _snapshot(conn, job_id, require_drained=False, job_ids=job_ids)
         _preserved_snapshot(chain[-1]["request"]["snapshot"], observed)
         return {"authority_history": chain, "current_snapshot": observed, "execution_authorized": False}
     finally:
@@ -357,7 +393,7 @@ def inspect_recovery_baselines():
             entry = _baseline_chain(conn, row)[-1]
             request = entry["request"]
             _verify_authority(request, conn)
-            if _snapshot(conn, row["job_id"], require_drained=False) != request["snapshot"]:
+            if _snapshot(conn, row["job_id"], require_drained=False, job_ids=request["snapshot"].get("job_ids")) != request["snapshot"]:
                 raise ValueError("preserved incident or a later execution changed")
             output.append(entry)
         return output
