@@ -8134,12 +8134,12 @@ def _wait_for_external_cron_worker(
 
 
 def _launch_external_cron_worker(job: dict) -> bool:
-    """Launch *job* outside a managed gateway cgroup when required.
+    """Transfer a supervised gateway job to its durable external owner.
 
-    Returns ``False`` when the caller is not a managed systemd gateway and the
-    existing in-process path should be used.  In managed topology, failure to
-    establish the transient scope raises: falling back would recreate the
-    restart interruption this handoff exists to prevent.
+    Managed Linux services require a separate systemd scope. On macOS the
+    existing new-session spawn leaves launchd's gateway process group. Other
+    topologies retain in-process execution. A failed handoff never falls back
+    to a second execution inside the gateway.
     """
     execution_id = str(job["execution_id"])
     job_id = str(job["id"])
@@ -8158,14 +8158,17 @@ def _launch_external_cron_worker(job: dict) -> bool:
 
     from agent.secret_scope import is_multiplex_active
     from tools.environments.local import build_subprocess_env
-    from tools.process_registry import restart_safe_gateway_child_argv
+    from tools.process_registry import (
+        _is_supervised_gateway_process, restart_safe_gateway_child_argv,
+    )
 
     multiplex_active = is_multiplex_active()
     scoped_command = restart_safe_gateway_child_argv(
         command,
         unit_suffix=f"cron-{job_id}-exec-{execution_id}",
     )
-    if scoped_command == command:
+    direct_macos_worker = sys.platform == "darwin" and _is_supervised_gateway_process()
+    if scoped_command == command and not direct_macos_worker:
         return False
 
     if mark_execution_handoff_pending(execution_id) is None:

@@ -458,9 +458,17 @@ def test_lost_execution_start_cas_prevents_side_effects(monkeypatch):
 
 @pytest.mark.linux_only
 @pytest.mark.live_system_guard_bypass
-def test_managed_gateway_restart_preserves_active_worker_and_single_side_effect(
-    tmp_path, monkeypatch
-):
+def test_managed_gateway_restart_preserves_active_worker_and_single_side_effect(tmp_path, monkeypatch):
+    _exercise_gateway_restart(tmp_path, monkeypatch)
+
+
+@pytest.mark.macos_only
+@pytest.mark.live_system_guard_bypass
+def test_macos_gateway_exit_preserves_job_owner_and_single_side_effect(tmp_path, monkeypatch):
+    _exercise_gateway_restart(tmp_path, monkeypatch)
+
+
+def _exercise_gateway_restart(tmp_path, monkeypatch):
     import cron.delivery_queue as delivery_queue
     import cron.executions as executions
     import cron.scheduler as scheduler
@@ -469,7 +477,7 @@ def test_managed_gateway_restart_preserves_active_worker_and_single_side_effect(
     from gateway.status import _pid_exists
     from tools import process_registry
 
-    if not process_registry._systemd_run_user_scope_available():
+    if sys.platform == "linux" and not process_registry._systemd_run_user_scope_available():
         pytest.skip("systemd-run --user --scope is unavailable on this host")
 
     home = tmp_path / "profile"
@@ -567,6 +575,7 @@ def test_managed_gateway_restart_preserves_active_worker_and_single_side_effect(
         assert current is not None
         execution = current
         worker_pid = int(current["pid"])
+        assert worker_pid != parent.pid
         assert not launched.exists(), "handoff returned before execution completed"
 
         # Replacing a managed gateway kills its old process tree. The active
@@ -574,6 +583,9 @@ def test_managed_gateway_restart_preserves_active_worker_and_single_side_effect(
         parent.terminate()
         parent.wait(timeout=5)
         assert _pid_exists(worker_pid)
+        assert executions.recover_interrupted_executions() == 0
+        assert executions.latest_execution(job["id"])["status"] == "running"
+        assert executions.latest_execution(job["id"])["pid"] == worker_pid
 
         release.write_text("go", encoding="utf-8")
         deadline = time.monotonic() + 10
@@ -599,5 +611,5 @@ def test_managed_gateway_restart_preserves_active_worker_and_single_side_effect(
         if parent.poll() is None:
             parent.terminate()
             parent.wait(timeout=5)
-        if worker_pid is not None and _pid_exists(worker_pid):
+        if worker_pid is not None and executions._owner_is_live(worker_pid, execution["process_started_at"]):
             os.kill(worker_pid, signal.SIGKILL)
