@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import pytest
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -983,3 +984,57 @@ def test_preparation_refuses_active_capture_and_missing_durable_observation(monk
         conn.execute("DELETE FROM cron_recovery_preparations")
     with pytest.raises(ValueError, match="observation is missing"):
         recovery.prepare_recovery_snapshot(request)
+
+
+def _health_only_succession(monkeypatch, tmp_path, change=None):
+    import hashlib, json
+    inc, recovery, original, receipt, request = _succession_fixture(monkeypatch, tmp_path)
+    baseline_path = Path(request["authority"]["baseline"]["path"])
+    review_path = Path(request["authority"]["review"]["path"])
+    baseline = json.loads(baseline_path.read_text())
+    baseline["authority_scope"] = "operational_health_only"
+    review = json.loads(review_path.read_text())
+    review.update(schema_version=1, mode="operational_incident_disposition_review_v1",
+                  authority_scope="operational_health_only", execution_authorized=False,
+                  replacement_authorized=False, collectors_activated=False, financial_work_resolved=False,
+                  controls={f"H{i}": "pass" for i in range(1, 6)})
+    review.pop("review_version", None)
+    if change:
+        change(baseline, review)
+    baseline_path.write_text(json.dumps(baseline))
+    request["authority"]["baseline"]["sha256"] = hashlib.sha256(baseline_path.read_bytes()).hexdigest()
+    review["recovery_baseline_sha256"] = request["authority"]["baseline"]["sha256"]
+    review_path.write_text(json.dumps(review))
+    request["authority"]["review"]["sha256"] = hashlib.sha256(review_path.read_bytes()).hexdigest()
+    request["baseline_id"] = recovery._digest({"snapshot": request["snapshot"], "authority": request["authority"]})
+    return inc, recovery, request
+
+
+def test_health_only_review_supersedes_operational_history_without_financial_authority(monkeypatch, tmp_path):
+    inc, recovery, request = _health_only_succession(monkeypatch, tmp_path)
+    before = inc.list_incidents()
+    receipt = recovery.supersede_recovery_baseline(request)
+    assert recovery.supersede_recovery_baseline(request) == receipt
+    assert recovery.inspect_recovery_baselines() == [{"request": request, "receipt": receipt}]
+    assert recovery.inspect_recovery_authority_history(request["snapshot"]["job_id"])["execution_authorized"] is False
+    assert inc.list_incidents() == before
+
+
+@pytest.mark.parametrize("change", [
+    lambda b, r: r.update(replacement_authorized=True),
+    lambda b, r: r.update(execution_authorized=True),
+    lambda b, r: r.update(collectors_activated=True),
+    lambda b, r: r.update(financial_work_resolved=True),
+    lambda b, r: r.update(authority_scope="financial"),
+    lambda b, r: b.update(authority_scope="financial"),
+    lambda b, r: b.pop("evidence_preparation"),
+    lambda b, r: r["controls"].update(H5="fail"),
+    lambda b, r: r.update(reviewer_model="collector"),
+])
+def test_health_review_refuses_unprepared_evidence_or_any_execution_grant(monkeypatch, tmp_path, change):
+    import pytest
+    inc, recovery, request = _health_only_succession(monkeypatch, tmp_path, change)
+    before = inc.list_incidents()
+    with pytest.raises(ValueError, match="prospective authority"):
+        recovery.supersede_recovery_baseline(request)
+    assert inc.list_incidents() == before

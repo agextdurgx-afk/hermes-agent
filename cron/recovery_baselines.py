@@ -137,19 +137,34 @@ def _verify_authority(request, conn=None, *, current=True):
             raise ValueError("baseline authority artifact changed")
         documents[name] = json.loads(content)
     baseline, review = documents["baseline"], documents["review"]
-    if (baseline.get("mode") != "prospective_recovery_baseline_v1"
-            or any(not re.fullmatch(r"[0-9a-f]{40}", str(baseline.get(key, ""))) for key in ("reviewed_tezoff_sha", "reviewed_hermes_sha"))
-            or baseline.get("incident_disposition") != "preserved_unresolved"
-            or baseline.get("cron_snapshot") != request.get("snapshot")
-            or review.get("recovery_baseline_sha256") != authority["baseline"]["sha256"]
-            or review.get("incident_disposition") != "preserved_unresolved"
-            or review.get("verdict") != "pass"
-            or review.get("reviewer_model") != "gpt-6-astra"
-            or review.get("schema_version") != 5 or review.get("review_version") != 5
-            or review.get("replacement_authorized") is not True
-            or any(review.get("controls", {}).get(f"A{i}") != "pass" for i in range(1, 13))
-            or review.get("reviewed_tezoff_sha") != baseline.get("reviewed_tezoff_sha")
-            or review.get("reviewed_hermes_sha") != baseline.get("reviewed_hermes_sha")):
+    common = (
+        baseline.get("mode") == "prospective_recovery_baseline_v1"
+        and all(re.fullmatch(r"[0-9a-f]{40}", str(baseline.get(key, ""))) for key in ("reviewed_tezoff_sha", "reviewed_hermes_sha"))
+        and baseline.get("authority_scope") in (None, "operational_health_only")
+        and baseline.get("incident_disposition") == "preserved_unresolved"
+        and baseline.get("cron_snapshot") == request.get("snapshot")
+        and review.get("recovery_baseline_sha256") == authority["baseline"]["sha256"]
+        and review.get("incident_disposition") == "preserved_unresolved"
+        and review.get("verdict") == "pass"
+        and review.get("reviewer_model") == "gpt-6-astra"
+        and all(review.get(key) == baseline.get(key) for key in ("reviewed_tezoff_sha", "reviewed_hermes_sha"))
+    )
+    legacy = (review.get("schema_version") == 5 and review.get("review_version") == 5
+              and review.get("replacement_authorized") is True
+              and all(review.get("controls", {}).get(f"A{i}") == "pass" for i in range(1, 13)))
+    health_only = (
+        review.get("schema_version") == 1
+        and review.get("mode") == "operational_incident_disposition_review_v1"
+        and baseline.get("authority_scope") == "operational_health_only"
+        and baseline.get("evidence_preparation") is not None
+        and review.get("authority_scope") == "operational_health_only"
+        and review.get("execution_authorized") is False
+        and review.get("replacement_authorized") is False
+        and review.get("collectors_activated") is False
+        and review.get("financial_work_resolved") is False
+        and all(review.get("controls", {}).get(f"H{i}") == "pass" for i in range(1, 6))
+    )
+    if not common or not (health_only if baseline.get("authority_scope") == "operational_health_only" else legacy):
         raise ValueError("baseline lacks exact prospective authority")
     if baseline.get("evidence_preparation") is not None:
         if conn is None or _prepared_snapshot(conn, baseline["evidence_preparation"], current=current) != request["snapshot"]:
