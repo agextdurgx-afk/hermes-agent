@@ -322,6 +322,12 @@ A file lock at `~/.hermes/cron/.tick.lock` prevents overlapping scheduler ticks 
 
 ### Execution history
 
+Unresolved incidents retain their referenced output logs and all failed attempts
+for their job, including before a review creates permanent evidence pins. Normal
+rotation still removes unrelated history. Closing an incident releases its live
+references, but never permanent receipt pins. Missing historical files are not
+reconstructed, and retained evidence does not authorize a retry or prove success.
+
 Hermes records each claimed cron attempt in the profile-local
 `~/.hermes/cron/executions.db` before executor or provider dispatch. Attempts
 move through `claimed`, `running`, and one immutable terminal state:

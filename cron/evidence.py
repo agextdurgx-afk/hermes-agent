@@ -40,6 +40,26 @@ def retain_evidence(conn, authority_id, entries):
         conn.execute("INSERT INTO cron_evidence_pins VALUES (?,?,?,?)", (authority_id, row["kind"], row["identity"], row["sha256"]))
 
 
+def unresolved_incident_evidence(conn):
+    """Retention before review: unresolved incidents still need their evidence.
+
+    This is a live reference inventory, not a receipt or an approval. A later
+    closed incident releases only this guard; immutable receipt pins still win.
+    """
+    if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='cron_incidents'").fetchone():
+        return {"job_ids": set(), "log_paths": set()}
+    jobs, paths = set(), set()
+    for job, output in conn.execute("SELECT job_id,output_file FROM cron_incidents WHERE state!='closed'"):
+        if not isinstance(job, str) or not job:
+            raise ValueError("unresolved cron incident has no job identity")
+        jobs.add(job)
+        if output is not None:
+            if not isinstance(output, str) or not output:
+                raise ValueError("unresolved cron incident has malformed output identity")
+            paths.add(output)
+    return {"job_ids": jobs, "log_paths": paths}
+
+
 def retained_log_paths(database_path):
     """An absent database has no pins; unreadable state must stop pruning."""
     path = Path(database_path)
@@ -50,7 +70,7 @@ def retained_log_paths(database_path):
     conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
     try:
         conn.execute("BEGIN")
-        return {row["identity"] for row in evidence_pins(conn, kind="log")}
+        return {row["identity"] for row in evidence_pins(conn, kind="log")} | unresolved_incident_evidence(conn)["log_paths"]
     finally:
         conn.rollback()
         conn.close()
@@ -68,7 +88,7 @@ def log_retention_guard(database_path):
     conn = sqlite3.connect(Path(database_path), timeout=30)
     try:
         conn.execute("BEGIN IMMEDIATE")
-        yield {row["identity"] for row in evidence_pins(conn, kind="log")}
+        yield {row["identity"] for row in evidence_pins(conn, kind="log")} | unresolved_incident_evidence(conn)["log_paths"]
     finally:
         conn.rollback()
         conn.close()

@@ -148,12 +148,18 @@ def _owner_is_live(pid: int, started_at: Optional[int]) -> bool:
 
 
 def _prune_unlocked(conn: sqlite3.Connection) -> None:
-    from cron.evidence import evidence_pins
+    from cron.evidence import evidence_pins, unresolved_incident_evidence
 
     # An unknown outcome is unresolved evidence, not expendable history.
     # Retain it even before a reviewer can prepare/pin a checkpoint.
     limit = max(0, int(MAX_TERMINAL_EXECUTIONS))
     pinned = {row["identity"] for row in evidence_pins(conn, kind="execution")}
+    # Incident rows do not carry an execution ID. Keep every failed attempt of
+    # an unresolved job until adjudication can bind exact failure/log evidence.
+    # Never guess an ID from truncated error text or release immutable pins.
+    unresolved_jobs = unresolved_incident_evidence(conn)["job_ids"]
+    if unresolved_jobs:
+        pinned.update(row[0] for row in conn.execute("SELECT id,job_id FROM executions WHERE status='failed'") if row[1] in unresolved_jobs)
     if pinned:
         stale = conn.execute(
             "SELECT id FROM executions WHERE status IN ('completed','failed') "
